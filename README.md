@@ -4,7 +4,9 @@ A Windows desktop library for isolated Microsoft Edge profiles, built with Rust 
 
 ## Run on Windows
 
-Use Windows 10 or 11 with Microsoft Edge (stable). To build from source, install stable Rust with the MSVC toolchain and the Visual Studio **Desktop development with C++** workload.
+Use Windows 10 or 11 with Microsoft Edge (stable). On the [Releases page](https://github.com/qxsch/ProfileSwitcher/releases), download `Switchboard-x64.msi` for Intel/AMD PCs or `Switchboard-arm64.msi` for Windows on Arm. Run the installer and open **Switchboard** from the Start menu. It installs for your account only. Uninstalling from **Settings → Apps** leaves your browser profiles and catalog intact.
+
+To build from source, install stable Rust with the MSVC toolchain and the Visual Studio **Desktop development with C++** workload.
 
 ```powershell
 cargo build --release --locked
@@ -32,6 +34,8 @@ Edge launches with a dedicated `--user-data-dir` and a Windows Job Object assign
 **Command line:** `switchboard.exe --open <profile-id>` opens or switches to a saved profile; `switchboard.exe --temporary` opens a disposable session. Neither requires the library window to be open.
 
 ## Development
+
+**Releasing:** Set the package version in `Cargo.toml`, update `Cargo.lock`, and publish a GitHub Release from that commit. The **Windows installers** workflow builds the tagged source on native x64 and ARM64 runners, installs and uninstalls each MSI, then attaches both installers directly to the release. A draft release or a tag push alone does not trigger it. The MSI version comes from Cargo; no ZIPs are generated.
 
 `cargo nextest run --locked --all-targets` runs the Windows test suite with per-test hang timeouts; GitHub Actions runs the same command on `windows-latest`. The tests cover library persistence, icon rendering, native shortcut files, job tracking, fake-clock cleanup deadlines, UI callback responsiveness, and an isolated helper process that holds a file lock (no Edge required). `cargo test --locked real_edge_session -- --ignored` additionally opens a disposable Edge instance and checks cleanup. It does not target any existing browser.
 

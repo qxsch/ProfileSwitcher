@@ -1,0 +1,26 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Switchboard" Manufacturer="qxsch" Version="$(var.Version)"
+           UpgradeCode="D87FB707-991A-47C4-AEA2-237C038B5172" Scope="perUser">
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of Switchboard is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="INSTALLFOLDER" Name="Switchboard">
+        <Component Id="SwitchboardApp" Guid="FC8484B4-1283-41FC-8821-EFC13C8EB098">
+          <RegistryValue Root="HKCU" Key="Software\Switchboard" Name="InstallPath"
+                         Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+          <File Id="SwitchboardExe" Name="switchboard.exe" Source="$(var.Executable)">
+            <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder"
+                      Name="Switchboard" WorkingDirectory="INSTALLFOLDER" Advertise="no" />
+          </File>
+          <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+    <Feature Id="Application" Title="Switchboard">
+      <ComponentRef Id="SwitchboardApp" />
+    </Feature>
+  </Package>
+</Wix>
