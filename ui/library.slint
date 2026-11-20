@@ -1,0 +1,277 @@
+import { LineEdit, ListView, ScrollView, CheckBox } from "std-widgets.slint";
+
+export struct Entry { id: string, name: string, group: string, icon: image, tint: color, live: bool, recent: string, selected: bool }
+export struct SymbolTile { index: int, name: string, art: image }
+export struct Swatch { name: string, tone: color }
+
+component Caption inherits Text {
+    font-size: 11px; font-weight: 700; letter-spacing: 1.4px; color: #536b5f;
+}
+component Label inherits Text {
+    font-size: 14px; color: #20362b; vertical-alignment: center; overflow: elide;
+}
+component Action inherits Rectangle {
+    in property <string> label;
+    in property <bool> strong;
+    in property <bool> dark;
+    in property <bool> current;
+    in property <bool> usable: true;
+    callback clicked;
+    preferred-width: title.preferred-width + 28px; min-width: title.preferred-width + 16px;
+    height: 36px; border-radius: 6px;
+    background: !usable ? #edf0e9 : dark ? (current || touch.has-hover ? #305444 : #173428) :
+        strong ? (touch.has-hover ? #306f50 : #245d42) : (touch.has-hover || current ? #e4eee1 : #ffffff);
+    border-width: keys.has-focus || (!dark && !strong) ? 1px : 0px;
+    border-color: keys.has-focus ? #75a165 : #d1dcd0;
+    accessible-role: button; accessible-label: label; accessible-enabled: usable;
+    accessible-action-default => { if usable { root.clicked(); } }
+    forward-focus: keys;
+    title := Text { text: root.label; font-size: 13px; font-weight: 600; horizontal-alignment: center; vertical-alignment: center;
+        color: !root.usable ? #778578 : root.dark || root.strong ? #f1f8ed : #274632; }
+    keys := FocusScope { enabled: root.usable; key-pressed(ev) => {
+        if ev.text == Key.Return || ev.text == Key.Space {root.clicked();return accept;} return reject;
+    } }
+    touch := TouchArea { enabled: root.usable; mouse-cursor: pointer; clicked => {keys.focus();root.clicked();} }
+}
+export component Library inherits Window {
+    title: "Switchboard  ·  Edge workspace"; icon: @image-url("brand.svg");
+    background: #fafbf8; default-font-family: "Segoe UI"; default-font-size: 14px;
+    preferred-width: 1220px; preferred-height: 770px; min-width: 920px; min-height: 620px;
+    in-out property <int> page; // library, profile editor, shortcut export
+    in-out property <string> search;
+    in property <string> section;
+    in property <string> group-filter;
+    in property <[string]> groups;
+    in property <[Entry]> entries;
+    in property <[Entry]> pinned;
+    in property <[Entry]> export-list;
+    in property <int> total;
+    in property <int> live-count;
+    in property <int> trash-count;
+    in property <int> marked;
+    in property <bool> by-name;
+    in-out property <string> notice;
+    in property <string> editor-id;
+    in-out property <string> edit-name;
+    in-out property <string> edit-group;
+    in-out property <bool> edit-pin;
+    in-out property <int> edit-symbol;
+    in-out property <int> edit-color;
+    in-out property <string> symbol-search;
+    in property <[SymbolTile]> symbols;
+    in property <[Swatch]> palette;
+    in property <image> preview;
+    in property <string> preview-name;
+    in property <string> folder;
+    in property <bool> has-last;
+    callback filter(string, string);
+    callback refresh();
+    callback toggle-sort();
+    callback toggle-selection(string);
+    callback select-row(string, bool, bool);
+    callback edit(string);
+    callback save();
+    callback choose-symbol(int);
+    callback choose-color(int);
+    callback filter-symbols();
+    callback launch(string);
+    callback launch-first();
+    callback trash(string);
+    callback temporary();
+    callback prepare-export();
+    callback pick-folder(string);
+    callback export-links();
+    callback cancel();
+    function find() { search-box.focus(); }
+    forward-focus: shortcuts;
+    shortcuts := FocusScope {
+        key-pressed(ev) => {
+            if root.page == 0 && ev.modifiers.control && (ev.text == "k" || ev.text == "K") { root.find(); return accept; }
+            if root.page == 0 && ev.modifiers.control && (ev.text == "n" || ev.text == "N") { root.edit(""); return accept; }
+            if root.page != 0 && ev.text == Key.Escape { root.cancel(); return accept; }
+            return reject;
+        }
+        HorizontalLayout {
+            rail := Rectangle {
+                width: 202px; background: #142e27;
+                VerticalLayout {
+                    padding: 14px; padding-top: 24px; padding-bottom: 20px; spacing: 8px;
+                    HorizontalLayout { height: 49px; spacing: 9px; padding-left: 4px;
+                        Image { width: 38px; source: @image-url("brand.svg"); image-fit: contain; }
+                        VerticalLayout { alignment: center;
+                            Label { text: "Switchboard"; color: #eff8eb; font-weight: 700; font-size: 18px; }
+                            Label { text: "Edge workspace"; color: #bdd2c4; font-size: 12px; }
+                        }
+                    }
+                    Rectangle { height: 15px; }
+                    Caption { text: "WORKSPACE"; color: #a9c5b6; }
+                    Action { label: "All profiles   ·   \{root.total}"; dark: true; current: root.section == "All profiles" && root.page == 0; clicked => { root.filter("All profiles",""); } }
+                    Action { label: "Running   ·   \{root.live-count}"; dark: true; current: root.section == "Running" && root.page == 0; clicked => { root.filter("Running",""); } }
+                    Action { label: "Trash   ·   \{root.trash-count}"; dark: true; current: root.section == "Trash" && root.page == 0; clicked => { root.filter("Trash",""); } }
+                    Rectangle { height: 1px; background: #375448; }
+                    Caption { text: "COLLECTIONS"; color: #a9c5b6; height: 30px; vertical-alignment: center; }
+                    if root.groups.length == 0: Label { text: "Add one when creating\na profile."; wrap: word-wrap; color: #b7cbbd; font-size: 12px; }
+                    ListView { for group in root.groups: Rectangle { height: 36px; background: nav-touch.has-hover || (root.group-filter == group && root.section == "Collection") ? #305444 : transparent; border-radius: 5px;
+                        Label { x: 10px; width: parent.width - 18px; text: group; color: #e2eee6; }
+                        nav-touch := TouchArea { mouse-cursor: pointer; clicked => {root.filter("Collection",group);} }
+                    } }
+                    Rectangle { height: 141px; border-radius: 10px; background: #234537; border-width: 1px; border-color: #476653;
+                        VerticalLayout { padding: 12px; spacing: 5px;
+                            Caption { text: "AD HOC"; color: #cbe8b6; }
+                            Label { text: "Temporary profile"; color: #eff8eb; font-weight: 600; font-size: 17px; }
+                            Label { text: "Clears after its last Edge\nprocess exits."; color: #cee0d1; font-size: 12px; }
+                            Action { label: "Start temporary  ↗"; clicked => { root.temporary(); } }
+                        }
+                    }
+                    Label { text: "●   Local workspace"; color: #cadfc6; font-size: 11px; height: 24px; }
+                }
+            }
+            Rectangle {
+                // Keep search instantiated so the global shortcut can focus it directly.
+                visible: root.page == 0; horizontal-stretch: root.page == 0 ? 1 : 0;
+                width: root.page == 0 ? parent.width - rail.width : 0px;
+                VerticalLayout {
+                    padding: 26px; spacing: 12px;
+                    Caption { text: "WORKSPACE   /   LIBRARY"; }
+                    HorizontalLayout {
+                        Label { text: "Profile library"; font-weight: 600; font-size: 34px; horizontal-stretch: 1; }
+                        Action { label: "+   New profile"; strong: true; clicked => {root.edit("");} }
+                    }
+                    Label { text: "\{root.total} saved profiles   ·   \{root.live-count} running now"; color: #50665a; }
+                    search-box := LineEdit { text <=> root.search; placeholder-text: "Find a profile by name or collection    ·    Ctrl K";
+                        edited => {root.refresh();} accepted => {root.launch-first();} }
+                    if root.pinned.length > 0 && root.section == "All profiles" && root.search == "": VerticalLayout { spacing: 6px;
+                        Caption { text: "PINNED"; }
+                        HorizontalLayout { spacing: 8px;
+                            for entry in root.pinned: Rectangle { horizontal-stretch: 1; height: 66px; border-radius: 9px; background: entry.tint.mix(#ffffff, pin-touch.has-hover ? 20% : 12%); border-width: 1px; border-color: entry.tint.mix(#ffffff,30%);
+                                HorizontalLayout { padding: 11px; spacing: 9px;
+                                    Image { width: 37px; source: entry.icon; image-fit: contain; }
+                                    VerticalLayout { alignment: center;
+                                        Label { text: entry.name; font-weight: 600; }
+                                        Label { text: entry.group; color: #53685b; font-size: 12px; }
+                                    }
+                                    Label { text: "↗"; width: 13px; }
+                                }
+                                pin-touch := TouchArea { mouse-cursor: pointer; clicked => {root.launch(entry.id);} }
+                            }
+                        }
+                    }
+                    HorizontalLayout { spacing: 8px;
+                        Label { text: root.section == "Collection" ? root.group-filter : root.section; font-size: 21px; font-weight: 600; horizontal-stretch: 1; }
+                        if root.section != "Trash": Action { label: root.marked > 1 ? "Create \{root.marked} shortcuts…" : "Create shortcut…"; usable: root.marked > 0; clicked => {root.prepare-export();} }
+                        Action { label: root.by-name ? "Sort: A–Z" : "Sort: Recent"; clicked => {root.toggle-sort();} }
+                    }
+                    Rectangle { height: 28px; background: #edf2eb; border-radius: 4px;
+                        Caption { x: 12px; text: "PROFILE    /    COLLECTION"; vertical-alignment: center; }
+                    }
+                    if root.entries.length == 0: VerticalLayout { alignment: center; spacing: 8px;
+                        Image { source: @image-url("brand.svg"); height: 48px; image-fit: contain; }
+                        Label { text: root.total == 0 && root.section == "All profiles" && root.search == "" ? "Your library starts here" : "No matching profiles"; horizontal-alignment: center; font-size: 22px; font-weight: 600; }
+                        Label { text: root.section == "Trash" ? "Trashed profiles can be restored here." : root.total == 0 ? "Create a profile for your first customer or lab." : "Try another search or collection."; horizontal-alignment: center; color: #647568; }
+                    }
+                    ListView { visible: root.entries.length > 0;
+                        for item in root.entries: Rectangle { height: 59px; background: item.selected ? #ecf4e8 : #ffffff;
+                            Rectangle { y: parent.height - 1px; height: 1px; background: #e1e8dd; }
+                            TouchArea { enabled: root.section != "Trash"; pointer-event(e) => {
+                                if e.kind == PointerEventKind.down && e.button == PointerEventButton.left {root.select-row(item.id,e.modifiers.control,e.modifiers.shift);}
+                            } }
+                            HorizontalLayout { padding-left: 9px; padding-right: 7px; spacing: 9px; alignment: stretch;
+                                if root.section != "Trash": CheckBox { width: 24px; checked: item.selected; accessible-label: "Select " + item.name; toggled => {root.toggle-selection(item.id);} }
+                                Image { width: 36px; source: item.icon; image-fit: contain; }
+                                VerticalLayout { alignment: center; horizontal-stretch: 1;
+                                    Label { text: item.name; font-size: 15px; font-weight: 600; }
+                                    Label { text: item.group; font-size: 12px; color: #5d7065; }
+                                }
+                                Label { width: 66px; text: item.live ? "●  Running" : "○  Closed"; color: item.live ? #25643e : #5c6e60; font-size: 12px; }
+                                if root.width > 1110px: Label { width: 78px; text: item.recent; color: #5c6e60; font-size: 12px; }
+                                if root.section != "Trash": VerticalLayout { alignment: center; Action { label: item.live ? "Switch to" : "Open  ↗"; clicked => {root.launch(item.id);} } }
+                                if root.section != "Trash": VerticalLayout { alignment: center; Action { label: "Edit"; clicked => {root.edit(item.id);} } }
+                                VerticalLayout { alignment: center; Action { label: root.section == "Trash" ? "Restore" : "Trash"; clicked => {root.trash(item.id);} } }
+                            }
+                        }
+                    }
+                    Label { text: root.notice != "" ? root.notice : "\{root.entries.length} profiles in view   ·   Select rows to create Windows shortcuts"; color: #45624e; font-size: 12px; wrap: word-wrap; }
+                }
+            }
+            if root.page == 1: VerticalLayout { padding: 25px; spacing: 9px;
+                Caption { text: "WORKSPACE   /   PROFILE STUDIO"; }
+                HorizontalLayout { spacing: 14px;
+                    Image { width: 56px; height: 56px; source: root.preview; }
+                    VerticalLayout { alignment: center;
+                        Label { text: root.editor-id == "" ? "Create profile" : "Edit profile"; font-size: 30px; font-weight: 600; }
+                        Label { text: "\{root.preview-name}   /   \{root.palette[root.edit-color].name}"; color: #59715e; }
+                    }
+                }
+                HorizontalLayout { spacing: 12px;
+                    VerticalLayout { spacing: 4px; Caption {text: "PROFILE NAME";} LineEdit { text <=> root.edit-name; placeholder-text: "e.g. Customer01"; } }
+                    VerticalLayout { spacing: 4px; Caption {text: "COLLECTION";} LineEdit { text <=> root.edit-group; placeholder-text: "e.g. Customers"; } }
+                }
+                CheckBox { text: "Pin to library"; checked <=> root.edit-pin; }
+                Caption { text: "COLOR PALETTE"; }
+                HorizontalLayout { spacing: 6px;
+                    for sw[i] in root.palette: Rectangle { height: 34px; border-width: root.edit-color == i ? 2px : 1px; border-color: root.edit-color == i ? sw.tone : #d4dfd3; border-radius: 6px; background: sw.tone.mix(#ffffff,13%);
+                        Label { text: (root.edit-color == i ? "✓  " : "●  ") + sw.name; color: sw.tone; horizontal-alignment: center; font-weight: 600; }
+                        TouchArea { mouse-cursor: pointer; clicked => {root.choose-color(i);} }
+                    }
+                }
+                HorizontalLayout { spacing: 12px;
+                    Caption { text: "SYMBOL LIBRARY   /   100"; vertical-alignment: center; horizontal-stretch: 1; }
+                    LineEdit { text <=> root.symbol-search; placeholder-text: "Find a symbol…"; edited => {root.filter-symbols();} }
+                }
+                ScrollView { horizontal-scrollbar-policy: always-off;
+                    VerticalLayout { width: parent.width - 15px; spacing: 4px;
+                        for row in ceil(root.symbols.length / 8): HorizontalLayout { spacing: 4px;
+                            for col in 8: Rectangle { height: 57px; horizontal-stretch: 1;
+                                private property <int> idx: row * 8 + col;
+                                private property <bool> exists: idx < root.symbols.length;
+                                private property <SymbolTile> tile: root.symbols[idx];
+                                border-radius: 6px; background: exists ? (root.edit-symbol == tile.index || tile-touch.has-hover ? #e3eddf : #f1f4ee) : transparent;
+                                border-width: exists && root.edit-symbol == tile.index ? 1px : 0px; border-color: #719477;
+                                if exists: VerticalLayout { alignment: center; spacing: 1px;
+                                    Image { height: 31px; source: tile.art; image-fit: contain; }
+                                    Label { text: tile.name; horizontal-alignment: center; font-size: 11px; }
+                                }
+                                tile-touch := TouchArea { enabled: exists; mouse-cursor: pointer; clicked => {root.choose-symbol(tile.index);} }
+                            }
+                        }
+                        if root.symbols.length == 0: Label { text: "No symbols match your search."; height: 40px; }
+                    }
+                }
+                HorizontalLayout { spacing: 9px;
+                    Label { text: root.notice; color: #7a422e; horizontal-stretch: 1; wrap: word-wrap; }
+                    Action { label: "Cancel"; clicked => {root.cancel();} }
+                    Action { label: root.editor-id == "" ? "Create profile" : "Save changes"; strong: true; clicked => {root.save();} }
+                }
+            }
+            if root.page == 2: VerticalLayout { padding: 30px; spacing: 14px;
+                Caption { text: "WORKSPACE   /   WINDOWS SHORTCUTS"; }
+                Label { text: "Create shortcuts"; font-size: 32px; font-weight: 600; }
+                Label { text: "Open these profiles directly from a folder, without opening the library first."; color: #52685a; wrap: word-wrap; }
+                Caption { text: "SAVE TO FOLDER"; }
+                HorizontalLayout { spacing: 8px;
+                    Rectangle { height: 36px; border-width: 1px; border-color: #bbcbbb; border-radius: 6px; background: #fff; horizontal-stretch: 1;
+                        Label { x: 9px; width: parent.width - 18px; text: root.folder; }
+                    }
+                    Action { label: "Browse…"; clicked => {root.pick-folder("browse");} }
+                }
+                HorizontalLayout { alignment: start; spacing: 7px;
+                    Action { label: "Desktop"; clicked => {root.pick-folder("desktop");} }
+                    Action { label: "Last folder"; usable: root.has-last; clicked => {root.pick-folder("last");} }
+                }
+                Caption { text: "FOLDER PREVIEW   /   \{root.export-list.length} SELECTED"; }
+                ListView { for item in root.export-list: Rectangle { height: 47px; background: #eff4ec; border-radius: 5px;
+                    HorizontalLayout { padding-left: 12px; spacing: 10px;
+                        Image { width: 31px; source: item.icon; image-fit: contain; }
+                        Label { text: item.name + ".lnk"; horizontal-stretch: 1; }
+                    }
+                } }
+                Label { text: "Only links are created. Browser data stays on this PC."; font-size: 13px; color: #52685a; }
+                HorizontalLayout { spacing: 9px;
+                    Label { text: root.notice; horizontal-stretch: 1; wrap: word-wrap; }
+                    Action { label: "Cancel"; clicked => {root.cancel();} }
+                    Action { label: "Create \{root.export-list.length} shortcut(s)"; strong: true; clicked => {root.export-links();} }
+                }
+            }
+        }
+    }
+}
