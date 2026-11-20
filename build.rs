@@ -13,9 +13,9 @@ fn main() {
     let frames: Vec<(u32, Vec<u8>)> = ICON_SIZES.iter().map(|&s| (s, render(&tree, s))).collect();
 
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    // The installer picks the icon up next to switchboard.exe (<target>/<profile>/).
-    let profile_dir = out.ancestors().nth(3).expect("cargo profile directory");
-    fs::write(profile_dir.join("switchboard.ico"), ico(&frames)).expect("write switchboard.ico");
+    // Cargo's build-dir layout is internal; the installer build reads OUT_DIR from
+    // the build-script-executed message instead of guessing it.
+    fs::write(out.join("switchboard.ico"), ico(&frames)).expect("write switchboard.ico");
 
     if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         // link.exe accepts compiled .res files directly, so no resource compiler is needed.

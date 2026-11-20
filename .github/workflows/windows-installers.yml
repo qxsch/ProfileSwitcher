@@ -34,7 +34,17 @@ jobs:
         with:
           dotnet-version: '8.0.x'
       - name: Build release executable
-        run: cargo build --locked --release --bin switchboard --target $env:TARGET
+        shell: pwsh
+        run: |
+          # build.rs writes the installer icon to its OUT_DIR, whose layout is internal to Cargo.
+          $messages = cargo build --locked --release --bin switchboard --target $env:TARGET --message-format=json-render-diagnostics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $icon = $messages | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object reason -eq 'build-script-executed' |
+            ForEach-Object { Join-Path $_.out_dir 'switchboard.ico' } |
+            Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Last 1
+          if (-not $icon) { throw 'The build script did not produce switchboard.ico.' }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "SWITCHBOARD_ICON=$icon"
       - name: Restore WiX
         run: dotnet tool restore
       - name: Build per-user installer
@@ -49,7 +59,7 @@ jobs:
           }
           dotnet wix build installer\Switchboard.wxs -arch $env:ARCH `
             -d "Version=$version" -d "Executable=target\$env:TARGET\release\switchboard.exe" `
-            -d "Icon=target\$env:TARGET\release\switchboard.ico" `
+            -d "Icon=$env:SWITCHBOARD_ICON" `
             -o "target\installer\Switchboard-$env:ARCH.msi"
       - name: Smoke-test install and uninstall
         shell: pwsh
