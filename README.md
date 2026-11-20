@@ -35,7 +35,7 @@ Edge launches with a dedicated `--user-data-dir` and a Windows Job Object assign
 
 ## Development
 
-**Releasing:** Set the package version in `Cargo.toml`, update `Cargo.lock`, and publish a GitHub Release from that commit. The **Windows installers** workflow builds the tagged source on native x64 and ARM64 runners, installs and uninstalls each MSI, then attaches both installers directly to the release. A draft release or a tag push alone does not trigger it. The MSI version comes from Cargo; no ZIPs are generated.
+**Releasing:** Publish a GitHub Release with a tag like `v1.2.3`. The **Windows installers** workflow builds the tagged source on native x64 and ARM64 runners, installs and uninstalls each MSI, then attaches both installers directly to the release. A draft release or a tag push alone does not trigger it. The MSI version comes from the tag (`v1.2.3` → `1.2.3`); no ZIPs are generated.
 
 `cargo nextest run --locked --all-targets` runs the Windows test suite with per-test hang timeouts; GitHub Actions runs the same command on `windows-latest`. The tests cover library persistence, icon rendering, native shortcut files, job tracking, fake-clock cleanup deadlines, UI callback responsiveness, and an isolated helper process that holds a file lock (no Edge required). `cargo test --locked real_edge_session -- --ignored` additionally opens a disposable Edge instance and checks cleanup. It does not target any existing browser.
 

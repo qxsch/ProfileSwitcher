@@ -13,7 +13,7 @@ use slint::{
 use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap, HashSet},
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::Write,
     path::PathBuf,
     rc::Rc,
@@ -70,6 +70,8 @@ fn push_activity(activity: &mut Vec<ActivityEvent>, event: ActivityEvent) {
     }
 }
 fn append_activity(store: &Store, event: &ActivityEvent, message: &str) -> Result<()> {
+    // On a fresh install, startup tasks log before any action has created the data folder.
+    fs::create_dir_all(&store.0)?;
     let path = store.0.join("switchboard.log");
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     serde_json::to_writer(
@@ -1190,6 +1192,16 @@ mod tests {
         software_renderer::{MinimalSoftwareWindow, RepaintBufferType},
     };
 
+    #[test]
+    fn activity_log_is_written_before_the_data_folder_exists() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let s = Store(dir.path().join("EdgeProfileSwitcher"));
+        let event = ActivityEvent::new("Startup check", ActivityScope::Progress, "Starting…");
+        append_activity(&s, &event, "Starting…")?;
+        let log = fs::read_to_string(s.0.join("switchboard.log"))?;
+        assert!(log.contains("Startup check · Starting…"));
+        Ok(())
+    }
     #[test]
     fn profile_studio_library_and_export_share_the_same_selection() -> Result<()> {
         struct TestPlatform(Rc<MinimalSoftwareWindow>);

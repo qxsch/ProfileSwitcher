@@ -39,11 +39,17 @@ jobs:
         run: dotnet tool restore
       - name: Build per-user installer
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
-          $version = ($metadata.packages | Where-Object name -eq 'switchboard').version
+          # MSI versions must be numeric, so a tag like v1.2.3 becomes 1.2.3.
+          $version = $env:RELEASE_TAG -replace '^[vV]', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Release tag '$env:RELEASE_TAG' must look like v1.2.3 to version the installer."
+          }
           dotnet wix build installer\Switchboard.wxs -arch $env:ARCH `
             -d "Version=$version" -d "Executable=target\$env:TARGET\release\switchboard.exe" `
+            -d "Icon=target\$env:TARGET\release\switchboard.ico" `
             -o "target\installer\Switchboard-$env:ARCH.msi"
       - name: Smoke-test install and uninstall
         shell: pwsh

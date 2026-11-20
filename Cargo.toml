@@ -23,6 +23,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [build-dependencies]
+resvg = { version = "0.49", default-features = false }
 slint-build = "1.16"
 
 [profile.dev]

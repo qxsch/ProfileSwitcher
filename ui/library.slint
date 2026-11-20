@@ -35,6 +35,17 @@ component Action inherits Rectangle {
     } }
     touch := TouchArea { enabled: root.usable; mouse-cursor: pointer; clicked => {keys.focus();root.clicked();} }
 }
+component ErrorBanner inherits Rectangle {
+    in property <string> message;
+    callback details;
+    callback dismiss;
+    border-radius: 6px; background: #fff0ed; border-width: 1px; border-color: #e6aaa0;
+    HorizontalLayout { padding: 6px; padding-left: 12px; spacing: 8px;
+        Label { text: root.message; color: #922f22; horizontal-stretch: 1; wrap: word-wrap; }
+        VerticalLayout { alignment: center; Action { label: "Details"; clicked => {root.details();} } }
+        VerticalLayout { alignment: center; Action { label: "Dismiss"; clicked => {root.dismiss();} } }
+    }
+}
 export component Library inherits Window {
     title: "Switchboard  ·  Edge workspace"; icon: @image-url("brand.svg");
     background: #fafbf8; default-font-family: "Segoe UI"; default-font-size: 14px;
@@ -168,13 +179,7 @@ export component Library inherits Window {
                         Label { text: "\{root.total} saved profiles   ·   \{root.live-count} running now" + (root.busy ? "   ·   Working…" : ""); color: #50665a; horizontal-stretch: 1; }
                         activity-button := Action { label: "Activity"; clicked => {root.show-activity();} }
                     }
-                    if root.error != "": Rectangle { height: 45px; border-radius: 6px; background: #fff0ed; border-width: 1px; border-color: #e6aaa0;
-                        HorizontalLayout { padding-left: 11px; padding-right: 7px; spacing: 8px;
-                            Label { text: root.error; color: #922f22; horizontal-stretch: 1; wrap: word-wrap; }
-                            Action { label: "Details"; clicked => {root.show-error(root.error);} }
-                            Action { label: "Dismiss"; clicked => {root.clear-error();} }
-                        }
-                    }
+                    if root.error != "": ErrorBanner { message: root.error; details => {root.show-error(root.error);} dismiss => {root.clear-error();} }
                     search-box := LineEdit { text <=> root.search; placeholder-text: "Find a profile by name or collection    ·    Ctrl K";
                         edited => {root.refresh();} accepted => {root.launch-first();} }
                     if root.pinned.length > 0 && root.section == "All profiles" && root.search == "": VerticalLayout { spacing: 6px;
@@ -294,13 +299,7 @@ export component Library inherits Window {
                         if root.symbols.length == 0: Label { text: "No symbols match your search."; height: 40px; }
                     }
                 }
-                if root.error != "": Rectangle { height: 45px; border-radius: 6px; background: #fff0ed; border-width: 1px; border-color: #e6aaa0;
-                    HorizontalLayout { padding-left: 11px; padding-right: 7px; spacing: 8px;
-                        Label { text: root.error; color: #922f22; horizontal-stretch: 1; wrap: word-wrap; }
-                        Action { label: "Details"; clicked => {root.show-error(root.error);} }
-                        Action { label: "Dismiss"; clicked => {root.clear-error();} }
-                    }
-                }
+                if root.error != "": ErrorBanner { message: root.error; details => {root.show-error(root.error);} dismiss => {root.clear-error();} }
                 HorizontalLayout { spacing: 9px;
                     Label { text: root.notice; color: #7a422e; horizontal-stretch: 1; wrap: word-wrap; }
                     Action { label: "Cancel"; clicked => {root.cancel();} }
@@ -330,13 +329,7 @@ export component Library inherits Window {
                     }
                 } }
                 Label { text: "Only links are created. Browser data stays on this PC."; font-size: 13px; color: #52685a; }
-                if root.error != "": Rectangle { height: 45px; border-radius: 6px; background: #fff0ed; border-width: 1px; border-color: #e6aaa0;
-                    HorizontalLayout { padding-left: 11px; padding-right: 7px; spacing: 8px;
-                        Label { text: root.error; color: #922f22; horizontal-stretch: 1; wrap: word-wrap; }
-                        Action { label: "Details"; clicked => {root.show-error(root.error);} }
-                        Action { label: "Dismiss"; clicked => {root.clear-error();} }
-                    }
-                }
+                if root.error != "": ErrorBanner { message: root.error; details => {root.show-error(root.error);} dismiss => {root.clear-error();} }
                 HorizontalLayout { spacing: 9px;
                     Label { text: root.notice; horizontal-stretch: 1; wrap: word-wrap; }
                     Action { label: "Cancel"; clicked => {root.cancel();} }

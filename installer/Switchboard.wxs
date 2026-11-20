@@ -4,6 +4,8 @@
     <MajorUpgrade AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="A newer version of Switchboard is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Icon Id="Switchboard.ico" SourceFile="$(var.Icon)" />
+    <Property Id="ARPPRODUCTICON" Value="Switchboard.ico" />
 
     <StandardDirectory Id="ProgramMenuFolder" />
     <StandardDirectory Id="LocalAppDataFolder">
