@@ -261,9 +261,45 @@ fn link_name(name: &str) -> String {
     }
 }
 pub fn shortcut(p: &Profile, icon: &Path, folder: &Path) -> Result<PathBuf> {
+    let name = link_name(&p.name);
+    let base = folder.to_owned();
+    write_link(p, icon, folder, move |i| {
+        Some(base.join(if i == 1 {
+            format!("{name}.lnk")
+        } else {
+            format!("{name} ({i}).lnk")
+        }))
+    })?
+    .context("There are too many shortcuts with this name in the destination.")
+}
+/// Recreates a link at its exact previous path; returns false if that path is already taken.
+pub fn shortcut_at(p: &Profile, icon: &Path, dest: &Path) -> Result<bool> {
+    let folder = dest.parent().context("Shortcut has no folder.")?;
+    let dest = dest.to_owned();
+    Ok(write_link(p, icon, folder, move |i| (i == 1).then(|| dest.clone()))?.is_some())
+}
+/// True only for a Switchboard link that opens this profile, so user files are never removed.
+pub fn is_profile_link(path: &Path, id: Uuid) -> bool {
+    let arg: Vec<u8> = format!("--open {id}")
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
+        && std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() < 1 << 20)
+        && std::fs::read(path).is_ok_and(|b| {
+            b.starts_with(&[0x4c, 0, 0, 0]) && b.windows(arg.len()).any(|s| s == arg)
+        })
+}
+fn write_link(
+    p: &Profile,
+    icon: &Path,
+    folder: &Path,
+    candidate: impl Fn(u32) -> Option<PathBuf> + Send + 'static,
+) -> Result<Option<PathBuf>> {
     // Keep COM apartment ownership independent of the UI backend.
     let (id, name, icon, folder) = (p.id, p.name.clone(), icon.to_owned(), folder.to_owned());
-    std::thread::spawn(move || -> Result<PathBuf> {
+    std::thread::spawn(move || -> Result<Option<PathBuf>> {
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         }
@@ -291,13 +327,8 @@ pub fn shortcut(p: &Profile, icon: &Path, folder: &Path) -> Result<PathBuf> {
         unsafe {
             persist.Save(&HSTRING::from(tmp.as_os_str()), true)?;
         }
-        let name = link_name(&name);
         for i in 1..=10000 {
-            let dest = folder.join(if i == 1 {
-                format!("{name}.lnk")
-            } else {
-                format!("{name} ({i}).lnk")
-            });
+            let Some(dest) = candidate(i) else { break };
             // MoveFileW never replaces an existing link, even when two exports race.
             match unsafe {
                 windows::Win32::Storage::FileSystem::MoveFileW(
@@ -305,7 +336,7 @@ pub fn shortcut(p: &Profile, icon: &Path, folder: &Path) -> Result<PathBuf> {
                     &HSTRING::from(dest.as_os_str()),
                 )
             } {
-                Ok(()) => return Ok(dest),
+                Ok(()) => return Ok(Some(dest)),
                 Err(e)
                     if [HRESULT::from_win32(183), HRESULT::from_win32(80)].contains(&e.code()) =>
                 {
@@ -314,14 +345,14 @@ pub fn shortcut(p: &Profile, icon: &Path, folder: &Path) -> Result<PathBuf> {
                 Err(e) => return Err(e.into()),
             }
         }
-        bail!("There are too many shortcuts with this name in the destination.")
+        Ok(None)
     })
     .join()
     .map_err(|_| anyhow::anyhow!("Shortcut writer stopped unexpectedly."))?
 }
 
-#[cfg(test)]
-pub fn stop_test_session(id: Uuid) -> Result<()> {
+/// Ends every process in a session's job; used only for disposable temporary sessions.
+pub fn stop_session(id: Uuid) -> Result<()> {
     use windows::Win32::System::SystemServices::JOB_OBJECT_TERMINATE;
     let h = Handle(unsafe { OpenJobObjectW(JOB_OBJECT_TERMINATE, false, &job_name(id))? });
     unsafe { TerminateJobObject(h.0, 0)? };
@@ -343,19 +374,16 @@ mod tests {
             pinned: false,
             trashed: false,
             opened: 0,
+            shortcuts: vec![],
         };
         let icon = d.path().join("test.ico");
         let a = shortcut(&p, &icon, d.path()).unwrap();
         let b = shortcut(&p, &icon, d.path()).unwrap();
         assert_eq!(a.file_name().unwrap(), "_NUL.txt.lnk");
         assert_ne!(a, b);
-        let bytes = std::fs::read(a).unwrap();
-        assert_eq!(&bytes[..4], &[0x4c, 0, 0, 0]);
-        let arg: Vec<_> = format!("--open {}", p.id)
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        assert!(bytes.windows(arg.len()).any(|s| s == arg));
+        assert!(is_profile_link(&a, p.id));
+        assert!(!is_profile_link(&a, Uuid::new_v4()));
+        assert!(!shortcut_at(&p, &icon, &a).unwrap());
     }
 
     #[test]

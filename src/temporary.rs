@@ -39,6 +39,58 @@ fn clean(store: &Store, id: Uuid) -> Result<()> {
     fs::remove_dir(dir)?;
     Ok(())
 }
+pub struct Session {
+    pub id: Uuid,
+    pub started: u64,
+    pub running: bool,
+}
+fn owned(item: &fs::DirEntry) -> Option<Uuid> {
+    let id = Uuid::parse_str(&item.file_name().to_string_lossy()).ok()?;
+    (item.file_name() == id.to_string().as_str()
+        && is_directory(&item.path()).ok()?
+        && item.path().join(MARKER).is_file())
+    .then_some(id)
+}
+/// Lists live sessions and leftovers whose automatic cleanup has not completed yet.
+pub fn sessions(store: &Store) -> Result<Vec<Session>> {
+    let root = store.0.join("Temporary");
+    if !root.try_exists()? || !is_directory(&root)? {
+        return Ok(vec![]);
+    }
+    let mut out = vec![];
+    for item in fs::read_dir(root)? {
+        let item = item?;
+        if let Some(id) = owned(&item) {
+            let started = fs::metadata(item.path().join(MARKER))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            out.push(Session {
+                id,
+                started,
+                running: native::running(id)?,
+            });
+        }
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.started));
+    Ok(out)
+}
+/// Ends a live session (its watcher then cleans up) or removes a leftover immediately.
+pub fn discard(store: &Store, id: Uuid) -> Result<()> {
+    if native::running(id)? {
+        native::stop_session(id)?;
+        for _ in 0..40 {
+            if !native::running(id)? {
+                break;
+            }
+            sleep(Duration::from_millis(100));
+        }
+    }
+    let _lock = store.lock()?;
+    clean(store, id)
+}
+/// Best-effort: a locked session is left in place and reported as a leftover by `sessions`.
 pub fn recover(store: &Store) -> Result<()> {
     let _lock = store.lock()?;
     let root = store.0.join("Temporary");
@@ -46,22 +98,16 @@ pub fn recover(store: &Store) -> Result<()> {
         return Ok(());
     }
     ensure!(is_directory(&root)?, "Temporary folder is redirected.");
+    let mut failed = None;
     for item in fs::read_dir(root)? {
-        let item = item?;
-        let Ok(id) = Uuid::parse_str(&item.file_name().to_string_lossy()) else {
-            continue;
-        };
-        if item.file_name() != id.to_string().as_str()
-            || !is_directory(&item.path())?
-            || !item.path().join(MARKER).is_file()
+        if let Some(id) = owned(&item?)
+            && !native::running(id)?
+            && let Err(e) = clean(store, id)
         {
-            continue;
-        }
-        if !native::running(id)? {
-            clean(store, id)?;
+            failed = Some(e);
         }
     }
-    Ok(())
+    failed.map_or(Ok(()), Err)
 }
 pub fn run(store: &Store) -> Result<()> {
     let id = Uuid::new_v4();
@@ -138,6 +184,10 @@ mod tests {
                 && native::running(id)?
             {
                 session = Some(id);
+                ensure!(
+                    sessions(&store)?.iter().any(|t| t.id == id && t.running),
+                    "Live temporary session is not listed as running."
+                );
                 if entry.path().join(r"Data\Local State").is_file()
                     || entry.path().join(r"Data\Default").is_dir()
                 {
@@ -151,7 +201,7 @@ mod tests {
         if let Some(id) = session
             && native::running(id)?
         {
-            native::stop_test_session(id)?;
+            native::stop_session(id)?;
         }
         ensure!(
             session.is_some() || worker.is_finished(),

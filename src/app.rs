@@ -1,6 +1,7 @@
 use crate::{
     Entry, Library, Swatch, SymbolTile, icons, native,
     store::{self, Profile, Store},
+    temporary,
 };
 use anyhow::{Context, Result, ensure};
 use slint::{
@@ -46,8 +47,11 @@ struct State {
     anchor: Option<Uuid>,
     images: HashMap<(usize, usize), Image>,
     destination: PathBuf,
-    previous: Option<(Vec<Profile>, Vec<bool>, u64)>,
+    temps: HashSet<Uuid>,
+    previous: Option<Snapshot>,
 }
+/// Last rendered catalog, profile activity, temporary activity, and minute.
+type Snapshot = (Vec<Profile>, Vec<bool>, Vec<(Uuid, bool)>, u64);
 impl State {
     fn image(&mut self, symbol: usize, color: usize) -> Result<Image> {
         if let Some(img) = self.images.get(&(symbol, color)) {
@@ -72,6 +76,33 @@ impl State {
             live,
             recent: relative(p.opened).into(),
             selected: self.selected.contains(&p.id),
+            temporary: false,
+        })
+    }
+    fn temp_entry(&mut self, t: &temporary::Session) -> Result<Entry> {
+        let symbol = icons::SYMBOLS
+            .iter()
+            .position(|(n, _)| *n == "Hourglass")
+            .unwrap_or(0);
+        let color = icons::COLORS
+            .iter()
+            .position(|(n, _)| *n == "Slate")
+            .unwrap_or(0);
+        Ok(Entry {
+            id: t.id.to_string().into(),
+            name: "Temporary session".into(),
+            group: if t.running {
+                "Ad hoc  ·  erased when Edge exits"
+            } else {
+                "Ad hoc  ·  cleanup pending"
+            }
+            .into(),
+            icon: self.image(symbol, color)?,
+            tint: tone(color),
+            live: t.running,
+            recent: relative(t.started).into(),
+            selected: false,
+            temporary: true,
         })
     }
     fn refresh(&mut self, ui: &Library, s: &Store, force: bool) -> Result<()> {
@@ -90,12 +121,14 @@ impl State {
             .iter()
             .map(|p| native::running(p.id))
             .collect::<Result<_>>()?;
+        let temps = temporary::sessions(s)?;
+        let temp_status: Vec<_> = temps.iter().map(|t| (t.id, t.running)).collect();
+        self.temps = temps.iter().map(|t| t.id).collect();
         let minute = store::now() / 60;
         if !force
-            && self
-                .previous
-                .as_ref()
-                .is_some_and(|(p, l, m)| p == &ps && l == &status && *m == minute)
+            && self.previous.as_ref().is_some_and(|(p, l, t, m)| {
+                p == &ps && l == &status && t == &temp_status && *m == minute
+            })
         {
             return Ok(());
         }
@@ -105,6 +138,20 @@ impl State {
         let mut groups = BTreeSet::<String>::new();
         let (mut rows, mut pinned) = (vec![], vec![]);
         let (mut total, mut live, mut trash) = (0, 0, 0);
+        for t in &temps {
+            if t.running {
+                live += 1;
+            } else {
+                trash += 1;
+            }
+            if (sec == "Running" && t.running) || (sec == "Trash" && !t.running) {
+                let e = self.temp_entry(t)?;
+                if e.name.to_lowercase().contains(&query) || e.group.to_lowercase().contains(&query)
+                {
+                    rows.push(e);
+                }
+            }
+        }
         for (p, &active) in ps.iter().zip(&status) {
             if p.trashed {
                 trash += 1;
@@ -142,7 +189,7 @@ impl State {
         ui.set_live_count(live);
         ui.set_trash_count(trash);
         ui.set_marked(self.selected.len() as i32);
-        self.previous = Some((ps, status, minute));
+        self.previous = Some((ps, status, temp_status, minute));
         Ok(())
     }
     fn symbols(&mut self, ui: &Library) -> Result<()> {
@@ -187,10 +234,26 @@ fn build_library(store: Store) -> Result<(Library, Timer)> {
             .collect(),
     ));
     ui.set_section("All profiles".into());
+    let recovery = temporary::recover(&store);
     state.borrow_mut().refresh(&ui, &store, true)?;
-    if let Err(e) = crate::temporary::recover(&store) {
-        ui.set_notice(format!("Temporary cleanup deferred: {e:#}").into());
+    let sessions = temporary::sessions(&store)?;
+    let open = sessions.iter().filter(|t| t.running).count();
+    let pending = sessions.len() - open;
+    let mut notes = vec![];
+    if open > 0 {
+        notes.push(format!(
+            "{open} temporary session(s) still running — see Running."
+        ));
     }
+    if pending > 0 {
+        notes.push(format!(
+            "{pending} temporary session(s) could not be erased automatically — see Trash."
+        ));
+    }
+    if let Err(e) = recovery {
+        notes.push(format!("Temporary cleanup deferred: {e:#}"));
+    }
+    ui.set_notice(notes.join("   ").into());
     // Every callback reports errors in its current view, without dismissing an unfinished form.
     fn report(ui: &Library, action: impl FnOnce() -> Result<()>) {
         if let Err(e) = action() {
@@ -268,6 +331,7 @@ fn build_library(store: Store) -> Result<(Library, Timer)> {
             pinned: false,
             trashed: false,
             opened: 0,
+            shortcuts: vec![],
         };
         let p = if id.is_empty() {
             &fresh
@@ -324,7 +388,15 @@ fn build_library(store: Store) -> Result<(Library, Timer)> {
         u.set_notice("".into());
         st.refresh(&u, s, true)
     });
-    bind!(on_launch, |u, _st, _s, id| {
+    bind!(on_launch, |u, st, _s, id| {
+        let uuid = Uuid::parse_str(&id)?;
+        if st.temps.contains(&uuid) {
+            ensure!(
+                native::focus(uuid)?,
+                "Could not find a window for this temporary session."
+            );
+            return Ok(());
+        }
         open_worker(&id)?;
         u.set_notice("Opening profile…".into());
         Ok(())
@@ -339,13 +411,36 @@ fn build_library(store: Store) -> Result<(Library, Timer)> {
         Ok(())
     });
     bind!(on_trash, |u, st, s, id| {
+        let uuid = Uuid::parse_str(&id)?;
+        if st.temps.contains(&uuid) {
+            if native::running(uuid)?
+                && rfd::MessageDialog::new()
+                    .set_title("End temporary session?")
+                    .set_description(
+                        "All Edge windows of this temporary session will close and its data will be erased.",
+                    )
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    != rfd::MessageDialogResult::Yes
+            {
+                return Ok(());
+            }
+            temporary::discard(s, uuid)?;
+            u.set_notice("Temporary session erased.".into());
+            return st.refresh(&u, s, true);
+        }
         let trash = u.get_section() != "Trash";
-        s.trash(Uuid::parse_str(&id)?, trash)?;
+        let links = s.trash(uuid, trash)?;
         u.set_notice(
-            if trash {
-                "Moved to Trash. You can restore this profile and its data at any time."
-            } else {
-                "Profile restored."
+            match (trash, links) {
+                (true, 0) => {
+                    "Moved to Trash. You can restore this profile and its data at any time.".into()
+                }
+                (true, n) => format!(
+                    "Moved to Trash and removed {n} shortcut(s). Restoring brings them back."
+                ),
+                (false, 0) => "Profile restored.".into(),
+                (false, n) => format!("Profile restored with {n} shortcut(s)."),
             }
             .into(),
         );
@@ -502,11 +597,25 @@ mod tests {
         assert_eq!(u.get_page(), 2);
         capture("shortcut-export-live")?;
         u.invoke_export_links();
-        assert!(folder.join("Lab-M365.lnk").exists());
+        let link = folder.join("Lab-M365.lnk");
+        assert!(link.exists());
         u.invoke_trash(id.clone());
+        assert!(!link.exists(), "trash removes tracked shortcuts");
         u.invoke_filter("Trash".into(), "".into());
         assert_eq!(u.get_entries().row_count(), 1);
         u.invoke_trash(id);
+        assert_eq!(u.get_trash_count(), 0);
+        assert!(link.exists(), "restore recreates tracked shortcuts");
+        let leftover = Uuid::new_v4();
+        let dir = s.0.join("Temporary").join(leftover.to_string());
+        std::fs::create_dir_all(dir.join("Data"))?;
+        std::fs::write(dir.join(".switchboard-session"), leftover.to_string())?;
+        u.invoke_refresh();
+        assert_eq!(u.get_trash_count(), 1);
+        let row = u.get_entries().row_data(0).unwrap();
+        assert!(row.temporary && !row.live);
+        u.invoke_trash(row.id);
+        assert!(!dir.exists());
         assert_eq!(u.get_trash_count(), 0);
         Ok(())
     }

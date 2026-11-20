@@ -19,6 +19,9 @@ pub struct Profile {
     pub pinned: bool,
     pub trashed: bool,
     pub opened: u64,
+    /// Links exported by Switchboard; removed while trashed and recreated on restore.
+    #[serde(default)]
+    pub shortcuts: Vec<PathBuf>,
 }
 #[derive(Default, Debug, Serialize, Deserialize)]
 pub struct Catalog {
@@ -115,6 +118,7 @@ impl Store {
                     pinned,
                     trashed: false,
                     opened: 0,
+                    shortcuts: vec![],
                 });
                 c.profiles.last_mut().unwrap()
             };
@@ -139,13 +143,39 @@ impl Store {
         tmp.persist(self.icon_path(p.id))?;
         Ok(())
     }
-    pub fn trash(&self, id: Uuid, trashed: bool) -> Result<()> {
+    /// Returns how many tracked shortcuts were removed (trash) or recreated (restore).
+    pub fn trash(&self, id: Uuid, trashed: bool) -> Result<usize> {
+        let icon = self.icon_path(id);
         self.update(|c| {
             if trashed && native::running(id)? {
                 bail!("Close this profile's Edge processes before moving it to Trash.");
             }
-            c.profile(id)?.trashed = trashed;
-            Ok(())
+            let p = c.profile(id)?;
+            p.trashed = trashed;
+            let mut changed = 0;
+            let mut kept = vec![];
+            for link in std::mem::take(&mut p.shortcuts) {
+                if trashed {
+                    if native::is_profile_link(&link, id) {
+                        fs::remove_file(&link).with_context(|| {
+                            format!("Could not remove the shortcut {}", link.display())
+                        })?;
+                        changed += 1;
+                    }
+                    // Missing or replaced links stay recorded so restore can bring back free paths.
+                    kept.push(link);
+                } else if native::is_profile_link(&link, id) {
+                    kept.push(link);
+                } else if link.parent().is_some_and(Path::is_dir)
+                    && !link.exists()
+                    && native::shortcut_at(p, &icon, &link)?
+                {
+                    changed += 1;
+                    kept.push(link);
+                }
+            }
+            p.shortcuts = kept;
+            Ok(changed)
         })
     }
     pub fn launch(&self, id: Uuid) -> Result<Option<native::Job>> {
@@ -175,13 +205,15 @@ impl Store {
                     !p.trashed,
                     "Cannot create a shortcut for a trashed profile."
                 );
-                native::shortcut(p, &self.icon_path(id), folder).with_context(|| {
+                let link = native::shortcut(p, &self.icon_path(id), folder).with_context(|| {
                     format!(
                         "Created {i} of {} shortcuts; could not create the link for {}.",
                         ids.len(),
                         p.name
                     )
                 })?;
+                p.shortcuts.retain(|l| native::is_profile_link(l, id));
+                p.shortcuts.push(link);
             }
             c.last_folder = Some(folder.into());
             Ok(())

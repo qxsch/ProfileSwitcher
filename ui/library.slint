@@ -1,6 +1,6 @@
 import { LineEdit, ListView, ScrollView, CheckBox } from "std-widgets.slint";
 
-export struct Entry { id: string, name: string, group: string, icon: image, tint: color, live: bool, recent: string, selected: bool }
+export struct Entry { id: string, name: string, group: string, icon: image, tint: color, live: bool, recent: string, selected: bool, temporary: bool }
 export struct SymbolTile { index: int, name: string, art: image }
 export struct Swatch { name: string, tone: color }
 
@@ -172,21 +172,22 @@ export component Library inherits Window {
                     ListView { visible: root.entries.length > 0;
                         for item in root.entries: Rectangle { height: 59px; background: item.selected ? #ecf4e8 : #ffffff;
                             Rectangle { y: parent.height - 1px; height: 1px; background: #e1e8dd; }
-                            TouchArea { enabled: root.section != "Trash"; pointer-event(e) => {
+                            TouchArea { enabled: root.section != "Trash" && !item.temporary; pointer-event(e) => {
                                 if e.kind == PointerEventKind.down && e.button == PointerEventButton.left {root.select-row(item.id,e.modifiers.control,e.modifiers.shift);}
                             } }
                             HorizontalLayout { padding-left: 9px; padding-right: 7px; spacing: 9px; alignment: stretch;
-                                if root.section != "Trash": CheckBox { width: 24px; checked: item.selected; accessible-label: "Select " + item.name; toggled => {root.toggle-selection(item.id);} }
+                                if root.section != "Trash" && !item.temporary: CheckBox { width: 24px; checked: item.selected; accessible-label: "Select " + item.name; toggled => {root.toggle-selection(item.id);} }
+                                if root.section != "Trash" && item.temporary: Rectangle { width: 24px; }
                                 Image { width: 36px; source: item.icon; image-fit: contain; }
                                 VerticalLayout { alignment: center; horizontal-stretch: 1;
                                     Label { text: item.name; font-size: 15px; font-weight: 600; }
                                     Label { text: item.group; font-size: 12px; color: #5d7065; }
                                 }
-                                Label { width: 66px; text: item.live ? "●  Running" : "○  Closed"; color: item.live ? #25643e : #5c6e60; font-size: 12px; }
+                                Label { width: 66px; text: item.live ? "●  Running" : item.temporary ? "◌  Leftover" : "○  Closed"; color: item.live ? #25643e : #5c6e60; font-size: 12px; }
                                 if root.width > 1110px: Label { width: 78px; text: item.recent; color: #5c6e60; font-size: 12px; }
                                 if root.section != "Trash": VerticalLayout { alignment: center; Action { label: item.live ? "Switch to" : "Open  ↗"; clicked => {root.launch(item.id);} } }
-                                if root.section != "Trash": VerticalLayout { alignment: center; Action { label: "Edit"; clicked => {root.edit(item.id);} } }
-                                VerticalLayout { alignment: center; Action { label: root.section == "Trash" ? "Restore" : "Trash"; clicked => {root.trash(item.id);} } }
+                                if root.section != "Trash" && !item.temporary: VerticalLayout { alignment: center; Action { label: "Edit"; clicked => {root.edit(item.id);} } }
+                                VerticalLayout { alignment: center; Action { label: item.temporary ? (item.live ? "End session" : "Erase now") : root.section == "Trash" ? "Restore" : "Trash"; clicked => {root.trash(item.id);} } }
                             }
                         }
                     }
