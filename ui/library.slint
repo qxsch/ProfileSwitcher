@@ -1,8 +1,10 @@
 import { LineEdit, ListView, ScrollView, CheckBox } from "std-widgets.slint";
 
-export struct Entry { id: string, name: string, group: string, icon: image, tint: color, live: bool, recent: string, selected: bool, temporary: bool }
+export struct Entry { id: string, name: string, group: string, icon: image, tint: color, live: bool, recent: string, selected: bool, temporary: bool, action-label: string, action-kind: string, action-busy: bool, action-error: string }
 export struct SymbolTile { index: int, name: string, art: image }
 export struct Swatch { name: string, tone: color }
+export enum ActivityScope { all, progress, completed, failed }
+export struct ActivityRow { clock: string, day: string, action: string, detail: string, status: ActivityScope }
 
 component Caption inherits Text {
     font-size: 11px; font-weight: 700; letter-spacing: 1.4px; color: #536b5f;
@@ -64,6 +66,29 @@ export component Library inherits Window {
     in property <string> preview-name;
     in property <string> folder;
     in property <bool> has-last;
+    in property <bool> busy;
+    in property <int> spinner-frame;
+    in-out property <string> error;
+    in-out property <string> error-details;
+    in property <[ActivityRow]> activity-rows;
+    in property <int> activity-total;
+    in-out property <string> activity-search;
+    in-out property <ActivityScope> activity-scope;
+    in-out property <bool> activity-open;
+    in property <string> confirm-title;
+    in property <string> confirm-text;
+    in property <string> confirm-action;
+    callback deliver();
+    callback reload();
+    callback delete(string);
+    callback empty-trash();
+    callback confirm(bool);
+    callback folder-chosen(string);
+    callback clear-error();
+    callback show-error(string);
+    callback show-activity();
+    callback filter-activity();
+    callback close-panel();
     callback filter(string, string);
     callback refresh();
     callback toggle-sort();
@@ -83,11 +108,15 @@ export component Library inherits Window {
     callback export-links();
     callback cancel();
     function find() { search-box.focus(); }
+    function dismiss-activity() { root.close-panel(); activity-button.focus(); }
     forward-focus: shortcuts;
     shortcuts := FocusScope {
+        enabled: !root.activity-open;
         key-pressed(ev) => {
             if root.page == 0 && ev.modifiers.control && (ev.text == "k" || ev.text == "K") { root.find(); return accept; }
             if root.page == 0 && ev.modifiers.control && (ev.text == "n" || ev.text == "N") { root.edit(""); return accept; }
+            if root.confirm-title != "" && ev.text == Key.Escape { root.confirm(false); return accept; }
+            if (root.error-details != "" || root.activity-open) && ev.text == Key.Escape { root.close-panel(); return accept; }
             if root.page != 0 && ev.text == Key.Escape { root.cancel(); return accept; }
             return reject;
         }
@@ -129,7 +158,6 @@ export component Library inherits Window {
             Rectangle {
                 // Keep search instantiated so the global shortcut can focus it directly.
                 visible: root.page == 0; horizontal-stretch: root.page == 0 ? 1 : 0;
-                width: root.page == 0 ? parent.width - rail.width : 0px;
                 VerticalLayout {
                     padding: 26px; spacing: 12px;
                     Caption { text: "WORKSPACE   /   LIBRARY"; }
@@ -137,7 +165,17 @@ export component Library inherits Window {
                         Label { text: "Profile library"; font-weight: 600; font-size: 34px; horizontal-stretch: 1; }
                         Action { label: "+   New profile"; strong: true; clicked => {root.edit("");} }
                     }
-                    Label { text: "\{root.total} saved profiles   ·   \{root.live-count} running now"; color: #50665a; }
+                    HorizontalLayout {
+                        Label { text: "\{root.total} saved profiles   ·   \{root.live-count} running now" + (root.busy ? "   ·   Working…" : ""); color: #50665a; horizontal-stretch: 1; }
+                        activity-button := Action { label: "Activity"; clicked => {root.show-activity();} }
+                    }
+                    if root.error != "": Rectangle { height: 45px; border-radius: 6px; background: #fff0ed; border-width: 1px; border-color: #e6aaa0;
+                        HorizontalLayout { padding-left: 11px; padding-right: 7px; spacing: 8px;
+                            Label { text: root.error; color: #922f22; horizontal-stretch: 1; wrap: word-wrap; }
+                            Action { label: "Details"; clicked => {root.show-error(root.error);} }
+                            Action { label: "Dismiss"; clicked => {root.clear-error();} }
+                        }
+                    }
                     search-box := LineEdit { text <=> root.search; placeholder-text: "Find a profile by name or collection    ·    Ctrl K";
                         edited => {root.refresh();} accepted => {root.launch-first();} }
                     if root.pinned.length > 0 && root.section == "All profiles" && root.search == "": VerticalLayout { spacing: 6px;
@@ -148,17 +186,18 @@ export component Library inherits Window {
                                     Image { width: 37px; source: entry.icon; image-fit: contain; }
                                     VerticalLayout { alignment: center;
                                         Label { text: entry.name; font-weight: 600; }
-                                        Label { text: entry.group; color: #53685b; font-size: 12px; }
+                                        Label { text: entry.action-busy ? entry.action-label : entry.group; color: #53685b; font-size: 12px; }
                                     }
                                     Label { text: "↗"; width: 13px; }
                                 }
-                                pin-touch := TouchArea { mouse-cursor: pointer; clicked => {root.launch(entry.id);} }
+                                pin-touch := TouchArea { enabled: !entry.action-busy; mouse-cursor: pointer; clicked => {root.launch(entry.id);} }
                             }
                         }
                     }
                     HorizontalLayout { spacing: 8px;
                         Label { text: root.section == "Collection" ? root.group-filter : root.section; font-size: 21px; font-weight: 600; horizontal-stretch: 1; }
                         if root.section != "Trash": Action { label: root.marked > 1 ? "Create \{root.marked} shortcuts…" : "Create shortcut…"; usable: root.marked > 0; clicked => {root.prepare-export();} }
+                        if root.section == "Trash": Action { label: "Empty Trash…"; usable: root.trash-count > 0 && !root.busy; clicked => {root.empty-trash();} }
                         Action { label: root.by-name ? "Sort: A–Z" : "Sort: Recent"; clicked => {root.toggle-sort();} }
                     }
                     Rectangle { height: 28px; background: #edf2eb; border-radius: 4px;
@@ -166,11 +205,11 @@ export component Library inherits Window {
                     }
                     if root.entries.length == 0: VerticalLayout { alignment: center; spacing: 8px;
                         Image { source: @image-url("brand.svg"); height: 48px; image-fit: contain; }
-                        Label { text: root.total == 0 && root.section == "All profiles" && root.search == "" ? "Your library starts here" : "No matching profiles"; horizontal-alignment: center; font-size: 22px; font-weight: 600; }
+                        Label { text: root.busy && root.total == 0 ? "Loading…" : root.total == 0 && root.section == "All profiles" && root.search == "" ? "Your library starts here" : "No matching profiles"; horizontal-alignment: center; font-size: 22px; font-weight: 600; }
                         Label { text: root.section == "Trash" ? "Trashed profiles can be restored here." : root.total == 0 ? "Create a profile for your first customer or lab." : "Try another search or collection."; horizontal-alignment: center; color: #647568; }
                     }
                     ListView { visible: root.entries.length > 0;
-                        for item in root.entries: Rectangle { height: 59px; background: item.selected ? #ecf4e8 : #ffffff;
+                        for item in root.entries: Rectangle { height: item.action-error != "" ? 72px : 59px; background: item.selected ? #ecf4e8 : #ffffff;
                             Rectangle { y: parent.height - 1px; height: 1px; background: #e1e8dd; }
                             TouchArea { enabled: root.section != "Trash" && !item.temporary; pointer-event(e) => {
                                 if e.kind == PointerEventKind.down && e.button == PointerEventButton.left {root.select-row(item.id,e.modifiers.control,e.modifiers.shift);}
@@ -181,13 +220,31 @@ export component Library inherits Window {
                                 Image { width: 36px; source: item.icon; image-fit: contain; }
                                 VerticalLayout { alignment: center; horizontal-stretch: 1;
                                     Label { text: item.name; font-size: 15px; font-weight: 600; }
-                                    Label { text: item.group; font-size: 12px; color: #5d7065; }
+                                    Label { text: item.action-error != "" ? "Failed · " + item.action-error : item.action-busy ? item.action-label : item.group; font-size: 12px; color: item.action-error != "" ? #a4382b : #5d7065; }
                                 }
                                 Label { width: 66px; text: item.live ? "●  Running" : item.temporary ? "◌  Leftover" : "○  Closed"; color: item.live ? #25643e : #5c6e60; font-size: 12px; }
                                 if root.width > 1110px: Label { width: 78px; text: item.recent; color: #5c6e60; font-size: 12px; }
-                                if root.section != "Trash": VerticalLayout { alignment: center; Action { label: item.live ? "Switch to" : "Open  ↗"; clicked => {root.launch(item.id);} } }
-                                if root.section != "Trash" && !item.temporary: VerticalLayout { alignment: center; Action { label: "Edit"; clicked => {root.edit(item.id);} } }
-                                VerticalLayout { alignment: center; Action { label: item.temporary ? (item.live ? "End session" : "Erase now") : root.section == "Trash" ? "Restore" : "Trash"; clicked => {root.trash(item.id);} } }
+                                if item.action-error != "": VerticalLayout { alignment: center; Action { label: "Details"; clicked => {root.show-error(item.action-error);} } }
+                                if root.section != "Trash": VerticalLayout { alignment: center; Action {
+                                    label: item.action-busy ? (root.spinner-frame == 0 ? "◴ " : root.spinner-frame == 1 ? "◷ " : root.spinner-frame == 2 ? "◶ " : "◵ ") + "Working…" :
+                                        item.action-error != "" && item.action-kind == "open" ? "Retry open" : item.live ? "Switch to" : "Open  ↗";
+                                    usable: !item.action-busy;
+                                    clicked => {root.launch(item.id);}
+                                } }
+                                if root.section != "Trash" && !item.temporary: VerticalLayout { alignment: center; Action { label: "Edit"; usable: !item.action-busy; clicked => {root.edit(item.id);} } }
+                                VerticalLayout { alignment: center; Action {
+                                    label: item.action-busy ? (root.spinner-frame == 0 ? "◴ " : root.spinner-frame == 1 ? "◷ " : root.spinner-frame == 2 ? "◶ " : "◵ ") + "Working…" :
+                                        item.action-error != "" && item.action-kind != "delete" && item.action-kind != "open" ? "Retry" :
+                                        item.temporary ? (item.live ? "End session" : "Erase now") : root.section == "Trash" ? "Restore" : "Trash";
+                                    usable: !item.action-busy;
+                                    clicked => {root.trash(item.id);}
+                                } }
+                                if root.section == "Trash" && !item.temporary: VerticalLayout { alignment: center; Action {
+                                    label: item.action-busy ? (root.spinner-frame == 0 ? "◴ " : root.spinner-frame == 1 ? "◷ " : root.spinner-frame == 2 ? "◶ " : "◵ ") + "Working…" :
+                                        item.action-kind == "delete" && item.action-error != "" ? "Retry delete" : "Delete forever";
+                                    usable: !item.action-busy;
+                                    clicked => {root.delete(item.id);}
+                                } }
                             }
                         }
                     }
@@ -238,6 +295,13 @@ export component Library inherits Window {
                         if root.symbols.length == 0: Label { text: "No symbols match your search."; height: 40px; }
                     }
                 }
+                if root.error != "": Rectangle { height: 45px; border-radius: 6px; background: #fff0ed; border-width: 1px; border-color: #e6aaa0;
+                    HorizontalLayout { padding-left: 11px; padding-right: 7px; spacing: 8px;
+                        Label { text: root.error; color: #922f22; horizontal-stretch: 1; wrap: word-wrap; }
+                        Action { label: "Details"; clicked => {root.show-error(root.error);} }
+                        Action { label: "Dismiss"; clicked => {root.clear-error();} }
+                    }
+                }
                 HorizontalLayout { spacing: 9px;
                     Label { text: root.notice; color: #7a422e; horizontal-stretch: 1; wrap: word-wrap; }
                     Action { label: "Cancel"; clicked => {root.cancel();} }
@@ -267,10 +331,140 @@ export component Library inherits Window {
                     }
                 } }
                 Label { text: "Only links are created. Browser data stays on this PC."; font-size: 13px; color: #52685a; }
+                if root.error != "": Rectangle { height: 45px; border-radius: 6px; background: #fff0ed; border-width: 1px; border-color: #e6aaa0;
+                    HorizontalLayout { padding-left: 11px; padding-right: 7px; spacing: 8px;
+                        Label { text: root.error; color: #922f22; horizontal-stretch: 1; wrap: word-wrap; }
+                        Action { label: "Details"; clicked => {root.show-error(root.error);} }
+                        Action { label: "Dismiss"; clicked => {root.clear-error();} }
+                    }
+                }
                 HorizontalLayout { spacing: 9px;
                     Label { text: root.notice; horizontal-stretch: 1; wrap: word-wrap; }
                     Action { label: "Cancel"; clicked => {root.cancel();} }
                     Action { label: "Create \{root.export-list.length} shortcut(s)"; strong: true; clicked => {root.export-links();} }
+                }
+            }
+        }
+    }
+    if root.confirm-title != "": Rectangle {
+        x: 0; y: 0; width: root.width; height: root.height; background: #0e1f1899;
+        TouchArea { }
+        Rectangle {
+            width: 460px; height: dialog.preferred-height; border-radius: 12px; background: #fafbf8;
+            border-width: 1px; border-color: #c9d6c7; drop-shadow-blur: 24px; drop-shadow-color: #00000040;
+            dialog := VerticalLayout { padding: 24px; spacing: 12px;
+                Label { text: root.confirm-title; font-size: 20px; font-weight: 600; wrap: word-wrap; }
+                Label { text: root.confirm-text; color: #52685a; wrap: word-wrap; }
+                HorizontalLayout { alignment: end; spacing: 9px; padding-top: 8px;
+                    Action { label: "Cancel"; clicked => {root.confirm(false);} }
+                    Action { label: root.confirm-action; strong: true; clicked => {root.confirm(true);} }
+                }
+            }
+        }
+    }
+    if root.error-details != "": Rectangle {
+        x: 0; y: 0; width: root.width; height: root.height; background: #0e1f1899;
+        TouchArea { clicked => {root.close-panel();} }
+        Rectangle {
+            width: 580px; height: panel.preferred-height; border-radius: 12px; background: #fafbf8;
+            border-width: 1px; border-color: #c9d6c7; drop-shadow-blur: 24px; drop-shadow-color: #00000040;
+            panel := VerticalLayout { padding: 24px; spacing: 12px;
+                Label { text: "Action details"; font-size: 20px; font-weight: 600; }
+                Text { text: root.error-details; color: #52685a; wrap: word-wrap; horizontal-stretch: 1; }
+                HorizontalLayout { alignment: end; padding-top: 8px;
+                    Action { label: "Close"; clicked => {root.close-panel();} }
+                }
+            }
+        }
+    }
+    if root.activity-open: FocusScope {
+        x: 0; y: 0; width: root.width; height: root.height;
+        init => { event-search.focus(); }
+        key-pressed(ev) => {
+            if ev.text == Key.Escape { root.dismiss-activity(); return accept; }
+            if ev.modifiers.control && (ev.text == "k" || ev.text == "K") { event-search.focus(); return accept; }
+            return reject;
+        }
+        Rectangle { background: #10251c88; TouchArea { clicked => { root.dismiss-activity(); } } }
+        Rectangle {
+            width: min(810px, root.width - 48px); height: min(580px, root.height - 48px);
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            border-radius: 14px; background: #fcfdfb; clip: true;
+            drop-shadow-blur: 24px; drop-shadow-color: #10291d55;
+            TouchArea {}
+            VerticalLayout {
+                Rectangle { height: 100px; background: #1d4031;
+                    VerticalLayout { padding-left: 24px; padding-right: 24px; alignment: center; spacing: 5px;
+                        Caption { text: "SWITCHBOARD   /   WORKSPACE"; color: #bad6bc; }
+                        HorizontalLayout { spacing: 12px;
+                            Label { text: "Recent activity"; font-size: 29px; font-weight: 600; color: #f4faf2; horizontal-stretch: 1; }
+                            VerticalLayout { alignment: center;
+                                Rectangle { width: 61px; height: 24px; background: #315640; border-radius: 12px;
+                                    Label { text: "●  Live"; font-size: 12px; font-weight: 600; color: #d3efc1; horizontal-alignment: center; }
+                                }
+                            }
+                        }
+                    }
+                }
+                VerticalLayout { padding: 20px; spacing: 13px;
+                    HorizontalLayout { height: 36px; spacing: 6px;
+                        event-search := LineEdit { horizontal-stretch: 1; text <=> root.activity-search;
+                            accessible-label: "Search activity"; placeholder-text: "Search actions or details…";
+                            edited => { root.filter-activity(); }
+                        }
+                        for item in [{name: "All", scope: ActivityScope.all}, {name: "Progress", scope: ActivityScope.progress},
+                                     {name: "Completed", scope: ActivityScope.completed}, {name: "Failed", scope: ActivityScope.failed}]: Action {
+                            label: item.name; strong: root.activity-scope == item.scope;
+                            clicked => { root.activity-scope = item.scope; root.filter-activity(); }
+                        }
+                    }
+                    VerticalLayout {
+                        Rectangle { height: 31px; background: #edf2eb;
+                            HorizontalLayout { padding-left: 14px; padding-right: 14px; spacing: 16px;
+                                Caption { text: "LOCAL TIME"; width: 96px; vertical-alignment: center; }
+                                Caption { text: "ACTIVITY"; horizontal-stretch: 1; vertical-alignment: center; }
+                                Caption { text: "STATUS"; width: 90px; vertical-alignment: center; }
+                            }
+                        }
+                        if root.activity-rows.length > 0: ListView {
+                            for event[i] in root.activity-rows: Rectangle {
+                                height: max(58px, event-info.preferred-height + 16px); background: mod(i, 2) == 0 ? #ffffff : #f7f9f5;
+                                Rectangle { height: 1px; y: parent.height - 1px; background: #e4eae1; }
+                                HorizontalLayout { padding-left: 14px; padding-right: 14px; spacing: 16px;
+                                    VerticalLayout { width: 96px; alignment: center; spacing: 2px;
+                                        Label { text: event.clock; font-family: "Consolas"; color: #304c3c; }
+                                        Label { text: event.day; font-size: 11px; color: #627568; }
+                                    }
+                                    event-info := VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 2px;
+                                        Label { text: event.action; font-weight: 600; }
+                                        if event.detail != "": Text { text: event.detail; font-size: 12px; color: #50665a; wrap: word-wrap; }
+                                    }
+                                    VerticalLayout { width: 90px; alignment: center;
+                                        Rectangle { height: 24px; border-radius: 12px;
+                                            background: event.status == ActivityScope.failed ? #fbe8e4 : event.status == ActivityScope.completed ? #dff0dc : #e6edf5;
+                                            Label { text: event.status == ActivityScope.failed ? "Failed" : event.status == ActivityScope.completed ? "Completed" : "Progress";
+                                                color: event.status == ActivityScope.failed ? #913a2a : event.status == ActivityScope.completed ? #295a36 : #3f5878;
+                                                font-size: 12px; font-weight: 600; horizontal-alignment: center;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if root.activity-rows.length == 0: VerticalLayout { alignment: center; spacing: 6px; vertical-stretch: 1;
+                            Label { text: root.activity-total == 0 ? "No activity yet" : "No matching events"; font-size: 18px; font-weight: 600; horizontal-alignment: center; }
+                            Label { text: root.activity-total == 0 ? "Profile actions will appear here as they happen." : "Try another search or clear the filters below.";
+                                horizontal-alignment: center; color: #5d7065; }
+                        }
+                    }
+                    HorizontalLayout { height: 36px; spacing: 8px;
+                        Label { text: "\{root.activity-rows.length} of \{root.activity-total} events   ·   This session   ·   Newest first";
+                            color: #52685a; font-size: 12px; horizontal-stretch: 1; }
+                        if root.activity-search != "" || root.activity-scope != ActivityScope.all: Action {
+                            label: "Clear filters"; clicked => { root.activity-search = ""; root.activity-scope = ActivityScope.all; root.filter-activity(); }
+                        }
+                        Action { label: "Close"; clicked => { root.dismiss-activity(); } }
+                    }
                 }
             }
         }

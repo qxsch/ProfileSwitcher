@@ -10,8 +10,14 @@ use std::{
 use uuid::Uuid;
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, HANDLE, HWND, LPARAM},
-        System::{Com::*, JobObjects::*, SystemServices::JOB_OBJECT_QUERY, Threading::*},
+        Foundation::{
+            CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, FILETIME, HANDLE, HWND, LPARAM,
+            WPARAM,
+        },
+        System::{
+            Com::*, JobObjects::*, RestartManager::*, SystemServices::JOB_OBJECT_QUERY,
+            Threading::*,
+        },
         UI::{Shell::*, WindowsAndMessaging::*},
     },
     core::{BOOL, GUID, HRESULT, HSTRING, Interface, PCWSTR, PWSTR},
@@ -86,6 +92,230 @@ fn active(job: &Handle) -> Result<bool> {
 }
 pub fn running(id: Uuid) -> Result<bool> {
     existing_job(id)?.as_ref().map(active).unwrap_or(Ok(false))
+}
+
+fn process_ids(job: &Handle) -> Result<Vec<u32>> {
+    const MAX_PROCESSES: usize = 4096;
+    let mut buffer = vec![0usize; 2 + MAX_PROCESSES];
+    unsafe {
+        QueryInformationJobObject(
+            Some(job.0),
+            JobObjectBasicProcessIdList,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * size_of::<usize>()) as u32,
+            None,
+        )?;
+        let list = &*buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+        ensure!(
+            list.NumberOfAssignedProcesses <= MAX_PROCESSES as u32
+                && list.NumberOfProcessIdsInList <= MAX_PROCESSES as u32,
+            "The Edge job contains more processes than Switchboard can safely enumerate."
+        );
+        Ok(std::slice::from_raw_parts(
+            list.ProcessIdList.as_ptr(),
+            list.NumberOfProcessIdsInList as usize,
+        )
+        .iter()
+        .map(|pid| *pid as u32)
+        .collect())
+    }
+}
+
+unsafe extern "system" fn close_windows_for_pids(hwnd: HWND, context: LPARAM) -> BOOL {
+    let pids = unsafe { &*(context.0 as *const Vec<u32>) };
+    let mut pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pids.contains(&pid) {
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+    BOOL(1)
+}
+
+fn close_job_windows(job: &Handle) -> Result<usize> {
+    let pids = process_ids(job)?;
+    unsafe {
+        EnumWindows(
+            Some(close_windows_for_pids),
+            LPARAM((&pids as *const Vec<u32>) as isize),
+        )?
+    };
+    Ok(pids.len())
+}
+
+/// Requests a graceful close for windows owned by a profile's Edge job.
+pub fn close_session_windows(id: Uuid) -> Result<usize> {
+    match existing_job(id)? {
+        Some(job) => close_job_windows(&job),
+        None => Ok(0),
+    }
+}
+
+fn rm_processes(files: &[PathBuf]) -> Result<Vec<RM_PROCESS_INFO>> {
+    let mut key = vec![0u16; CCH_RM_SESSION_KEY as usize + 1];
+    let mut session = 0;
+    let status = unsafe { RmStartSession(&mut session, Some(0), PWSTR(key.as_mut_ptr())) };
+    ensure!(
+        status.0 == 0,
+        "Restart Manager could not start a cleanup session: {}",
+        status.0
+    );
+    struct Session(u32);
+    impl Drop for Session {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = RmEndSession(self.0);
+            }
+        }
+    }
+    let _session = Session(session);
+    let names: Vec<_> = files
+        .iter()
+        .map(|path| HSTRING::from(path.as_os_str()))
+        .collect();
+    let pointers: Vec<_> = names.iter().map(|name| PCWSTR(name.as_ptr())).collect();
+    let status = unsafe { RmRegisterResources(session, Some(&pointers), None, None) };
+    ensure!(
+        status.0 == 0,
+        "Restart Manager could not register profile files: {}",
+        status.0
+    );
+
+    let mut required = 0;
+    let mut count = 0;
+    let mut reboot_reasons = 0;
+    let status = unsafe {
+        RmGetList(
+            session,
+            &mut required,
+            &mut count,
+            None,
+            &mut reboot_reasons,
+        )
+    };
+    if status.0 != ERROR_MORE_DATA.0 && status.0 != 0 {
+        anyhow::bail!(
+            "Restart Manager could not identify file-locking processes: {}",
+            status.0
+        );
+    }
+    if required == 0 {
+        return Ok(vec![]);
+    }
+    let mut processes = vec![RM_PROCESS_INFO::default(); required as usize];
+    count = required;
+    let status = unsafe {
+        RmGetList(
+            session,
+            &mut required,
+            &mut count,
+            Some(processes.as_mut_ptr()),
+            &mut reboot_reasons,
+        )
+    };
+    ensure!(
+        status.0 == 0,
+        "Restart Manager could not list file-locking processes: {}",
+        status.0
+    );
+    processes.truncate(count as usize);
+    Ok(processes)
+}
+
+fn same_process(handle: HANDLE, expected: FILETIME) -> bool {
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe {
+        GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user).is_ok()
+            && created.dwLowDateTime == expected.dwLowDateTime
+            && created.dwHighDateTime == expected.dwHighDateTime
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LockingProcess {
+    pub pid: u32,
+    pub started: FILETIME,
+    pub edge: bool,
+}
+
+/// Returns only processes Restart Manager reports as holding a registered profile file.
+pub fn processes_locking(files: &[PathBuf]) -> Result<Vec<LockingProcess>> {
+    let mut out = Vec::new();
+    for process in rm_processes(files)? {
+        let edge = if let Ok(handle) = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                process.Process.dwProcessId,
+            )
+        } {
+            let handle = Handle(handle);
+            if !same_process(handle.0, process.Process.ProcessStartTime) {
+                continue;
+            }
+            let mut image = vec![0u16; 32768];
+            let mut length = image.len() as u32;
+            unsafe {
+                QueryFullProcessImageNameW(
+                    handle.0,
+                    PROCESS_NAME_WIN32,
+                    PWSTR(image.as_mut_ptr()),
+                    &mut length,
+                )
+            }
+            .is_ok()
+                && Path::new(&std::ffi::OsString::from_wide(&image[..length as usize]))
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("msedge.exe"))
+        } else {
+            false
+        };
+        out.push(LockingProcess {
+            pid: process.Process.dwProcessId,
+            started: process.Process.ProcessStartTime,
+            edge,
+        });
+    }
+    Ok(out)
+}
+
+/// Terminates a process only if its PID and creation time still match the Restart Manager result.
+pub fn terminate_edge_process(pid: u32, started: FILETIME) -> Result<bool> {
+    let handle = match unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            false,
+            pid,
+        )
+    } {
+        Ok(handle) => Handle(handle),
+        Err(_) => return Ok(false),
+    };
+    if !same_process(handle.0, started) {
+        return Ok(false);
+    }
+    let mut image = vec![0u16; 32768];
+    let mut length = image.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            handle.0,
+            PROCESS_NAME_WIN32,
+            PWSTR(image.as_mut_ptr()),
+            &mut length,
+        )?;
+    }
+    ensure!(
+        Path::new(&std::ffi::OsString::from_wide(&image[..length as usize]))
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("msedge.exe")),
+        "Refusing to terminate a non-Edge process reported by Restart Manager."
+    );
+    unsafe { TerminateProcess(handle.0, 1)? };
+    Ok(true)
 }
 
 // Attaching the job at creation leaves no window for a Chromium child to escape accounting.
@@ -384,6 +614,31 @@ mod tests {
         assert!(is_profile_link(&a, p.id));
         assert!(!is_profile_link(&a, Uuid::new_v4()));
         assert!(!shortcut_at(&p, &icon, &a).unwrap());
+    }
+
+    #[test]
+    fn generated_shortcut_names_never_escape_or_become_empty() {
+        let alphabet = [
+            'a', 'Z', '/', '\\', ':', '*', '?', '"', '<', '>', '|', '.', ' ', '\u{1}', '²',
+        ];
+        let mut seed = 0x9e37_79b9_u32;
+        for case in 0..2048 {
+            let length = case % 120;
+            let mut input = String::new();
+            for _ in 0..length {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                input.push(alphabet[(seed as usize) % alphabet.len()]);
+            }
+            let name = link_name(&input);
+            assert!(!name.is_empty());
+            assert!(
+                !name
+                    .chars()
+                    .any(|c| c.is_control() || r#"<>:"/\|?*"#.contains(c))
+            );
+            assert!(!name.ends_with([' ', '.']));
+            assert!(name.chars().count() <= 81);
+        }
     }
 
     #[test]

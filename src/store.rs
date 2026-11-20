@@ -61,6 +61,20 @@ impl Store {
         f.lock()?;
         Ok(f)
     }
+    pub fn try_lock(&self) -> Result<Option<File>> {
+        fs::create_dir_all(&self.0)?;
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(self.0.join("library.lock"))?;
+        match f.try_lock() {
+            Ok(()) => Ok(Some(f)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
     pub fn read(&self) -> Result<Catalog> {
         let file = match File::open(self.0.join("library.json")) {
             Ok(f) => f,
@@ -178,6 +192,48 @@ impl Store {
             Ok(changed)
         })
     }
+    /// Permanently removes a trashed profile, its browser data, artwork, and tracked links.
+    pub fn delete(&self, id: Uuid) -> Result<()> {
+        use crate::temporary::is_directory;
+        let root = self.0.join("Profiles");
+        let data = root.join(id.to_string());
+        self.update(|c| {
+            let i = c
+                .profiles
+                .iter()
+                .position(|p| p.id == id)
+                .context("This profile is no longer in the library.")?;
+            ensure!(
+                c.profiles[i].trashed,
+                "Move the profile to Trash before deleting it."
+            );
+            ensure!(
+                !native::running(id)?,
+                "Close this profile's Edge processes before deleting it."
+            );
+            if data.try_exists()? {
+                ensure!(
+                    is_directory(&root)? && is_directory(&data)?,
+                    "Refusing to delete redirected browser data."
+                );
+                fs::remove_dir_all(&data).with_context(|| {
+                    format!(
+                        "Could not delete all browser data of {}; some files are in use.",
+                        c.profiles[i].name
+                    )
+                })?;
+            }
+            for link in &c.profiles[i].shortcuts {
+                if native::is_profile_link(link, id) {
+                    let _ = fs::remove_file(link);
+                }
+            }
+            c.profiles.remove(i);
+            Ok(())
+        })?;
+        let _ = fs::remove_file(self.icon_path(id));
+        Ok(())
+    }
     pub fn launch(&self, id: Uuid) -> Result<Option<native::Job>> {
         self.update(|c| {
             let p = c.profile(id)?;
@@ -254,5 +310,17 @@ mod tests {
             fs::read_to_string(s.0.join("library.json")).unwrap(),
             "broken"
         );
+    }
+
+    #[test]
+    fn try_lock_is_nonblocking_and_recovers_after_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store(dir.path().into());
+        let lock = store.lock().unwrap();
+        let started = std::time::Instant::now();
+        assert!(store.try_lock().unwrap().is_none());
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        drop(lock);
+        assert!(store.try_lock().unwrap().is_some());
     }
 }

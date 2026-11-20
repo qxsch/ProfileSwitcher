@@ -1,15 +1,9 @@
 #![windows_subsystem = "windows"]
-mod app;
-mod icons;
-mod native;
-mod store;
-mod temporary;
-
-slint::include_modules!();
+use switchboard::{app, store::Store, temporary};
 
 fn start() -> anyhow::Result<()> {
     use anyhow::Context;
-    let s = store::Store::local()?;
+    let s = Store::local()?;
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [] => app::run(s),
