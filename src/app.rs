@@ -2,7 +2,7 @@
 //! filesystem, Job Object, and Edge call runs on one background worker, so the window stays
 //! responsive however long an action takes.
 use crate::{
-    ActivityRow, ActivityScope, Entry, Library, Swatch, SymbolTile, icons, native,
+    ActivityRow, ActivityScope, Entry, Library, Swatch, SymbolTile, icons, jump_list, native,
     store::{self, Profile, Store},
     temporary,
 };
@@ -179,11 +179,13 @@ struct Worker {
     mail: Arc<Mutex<Mailbox>>,
 }
 impl Worker {
-    fn spawn(store: Store, weak: slint::Weak<Library>) -> Self {
+    fn spawn(store: Store, weak: slint::Weak<Library>, update_jump_list: bool) -> Self {
         let (tx, rx) = mpsc::channel::<Option<TaskSpec>>();
         let mail = Arc::new(Mutex::new(Mailbox::default()));
         let shared = mail.clone();
         std::thread::spawn(move || {
+            let mut last_jump_list = None;
+            let mut jump_list_failed = false;
             // Tasks run one at a time, so actions never race each other on the catalog.
             while let Ok(task) = rx.recv() {
                 let outcome = task.map(|task| {
@@ -243,10 +245,43 @@ impl Worker {
                     result
                 });
                 let data = load(&store).map_err(|e| format!("{e:#}"));
+                let mut jump_list_error = None;
+                if update_jump_list
+                    && let Ok(data) = &data
+                    && (last_jump_list.as_ref() != Some(&data.profiles)
+                        || (jump_list_failed && outcome.is_some()))
+                {
+                    match jump_list::refresh(&store) {
+                        Ok(profiles) => {
+                            last_jump_list = Some(profiles);
+                            jump_list_failed = false;
+                        }
+                        Err(error) => {
+                            last_jump_list = Some(data.profiles.clone());
+                            jump_list_failed = true;
+                            let mut detail = format!("{error:#}");
+                            let event = ActivityEvent::new(
+                                "Updating taskbar recent profiles",
+                                ActivityScope::Failed,
+                                &detail,
+                            );
+                            if let Err(log_error) = append_activity(&store, &event, &detail) {
+                                detail.push_str(&format!(
+                                    "; could not write switchboard.log: {log_error:#}"
+                                ));
+                            }
+                            jump_list_error = Some((event, detail));
+                        }
+                    }
+                }
                 {
                     let mut m = shared.lock().unwrap();
                     if let Err(error) = &data {
                         m.last_error = Some(error.clone());
+                    }
+                    if let Some((event, error)) = jump_list_error {
+                        push_activity(&mut m.activity, event);
+                        m.last_error = Some(error);
                     }
                     if let Some(o) = outcome {
                         m.outcomes.push(o);
@@ -690,10 +725,13 @@ fn purge(s: &Store, profiles: Vec<Uuid>, temps: Vec<Uuid>, progress: &Progress) 
     }
 }
 
-fn build_library(store: Store) -> Result<(Library, Timer, Timer, Rc<Worker>)> {
+fn build_library(
+    store: Store,
+    update_jump_list: bool,
+) -> Result<(Library, Timer, Timer, Rc<Worker>)> {
     let ui = Library::new()?;
     let state = Rc::new(RefCell::new(State::default()));
-    let worker = Rc::new(Worker::spawn(store.clone(), ui.as_weak()));
+    let worker = Rc::new(Worker::spawn(store.clone(), ui.as_weak(), update_jump_list));
     ui.set_palette(model(
         icons::COLORS
             .iter()
@@ -1180,7 +1218,7 @@ fn build_library(store: Store) -> Result<(Library, Timer, Timer, Rc<Worker>)> {
     Ok((ui, timer, spinner_timer, worker))
 }
 pub fn run(store: Store) -> Result<()> {
-    let (ui, _timer, _spinner_timer, _worker) = build_library(store)?;
+    let (ui, _timer, _spinner_timer, _worker) = build_library(store, true)?;
     Ok(ui.run()?)
 }
 
@@ -1220,7 +1258,7 @@ mod tests {
             c.last_folder = Some(folder.clone());
             Ok(())
         })?;
-        let (u, _timer, _spinner_timer, worker) = build_library(s.clone())?;
+        let (u, _timer, _spinner_timer, worker) = build_library(s.clone(), false)?;
         // No event loop runs here, so pull worker results the way the timer would.
         let settle = || {
             for _ in 0..1000 {

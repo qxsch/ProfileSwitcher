@@ -1,8 +1,9 @@
 #![windows_subsystem = "windows"]
-use switchboard::{app, store::Store, temporary};
+use switchboard::{app, jump_list, store::Store, temporary};
 
 fn start() -> anyhow::Result<()> {
     use anyhow::Context;
+    jump_list::initialize()?;
     let s = Store::local()?;
     let args: Vec<_> = std::env::args().skip(1).collect();
     match args.as_slice() {
@@ -21,9 +22,30 @@ fn start() -> anyhow::Result<()> {
                 }
                 s.trash(id, false)?;
             }
-            if let Some(job) = s.launch(id)? {
+            let job = s.launch(id)?;
+            if let Err(error) = jump_list::refresh(&s) {
+                rfd::MessageDialog::new()
+                    .set_title("Switchboard")
+                    .set_level(rfd::MessageLevel::Warning)
+                    .set_description(format!(
+                        "The profile opened, but taskbar recent profiles could not be updated:\n{error:#}"
+                    ))
+                    .show();
+            }
+            if let Some(job) = job {
+                let name = s.read()?.profile(id)?.name.clone();
+                let mut brand = switchboard::native::WindowBrand::new(id, &name, &s.icon_path(id))?;
                 while job.active()? {
-                    std::thread::sleep(std::time::Duration::from_millis(750));
+                    if brand.icon_changed()
+                        && let Ok(name) = s
+                            .read()
+                            .and_then(|mut c| c.profile(id).map(|p| p.name.clone()))
+                    {
+                        brand.rename(&name);
+                    }
+                    // Branding is cosmetic; a failed pass must not end the session watcher.
+                    let _ = brand.apply(&job);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
                 }
             }
             Ok(())

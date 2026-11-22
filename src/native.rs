@@ -14,11 +14,26 @@ use windows::{
             CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, FILETIME, HANDLE, HWND, LPARAM,
             WPARAM,
         },
+        Storage::EnhancedStorage::{
+            PKEY_AppUserModel_ID, PKEY_AppUserModel_RelaunchCommand,
+            PKEY_AppUserModel_RelaunchDisplayNameResource, PKEY_AppUserModel_RelaunchIconResource,
+            PKEY_Title,
+        },
         System::{
-            Com::*, JobObjects::*, RestartManager::*, SystemServices::JOB_OBJECT_QUERY,
+            Com::{StructuredStorage::PROPVARIANT, *},
+            JobObjects::*,
+            RestartManager::*,
+            SystemServices::JOB_OBJECT_QUERY,
             Threading::*,
         },
-        UI::{Shell::*, WindowsAndMessaging::*},
+        UI::{
+            HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
+            Shell::{
+                PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow},
+                *,
+            },
+            WindowsAndMessaging::*,
+        },
     },
     core::{BOOL, GUID, HRESULT, HSTRING, Interface, PCWSTR, PWSTR},
 };
@@ -398,17 +413,15 @@ pub fn launch_edge(id: Uuid, dir: &Path, temporary: bool) -> Result<Job> {
     launch_in_job(id, &edge()?, &args, temporary)
 }
 
-pub fn focus(id: Uuid) -> Result<bool> {
-    let Some(job) = existing_job(id)? else {
-        return Ok(false);
-    };
+/// Visible top-level Edge windows whose process belongs to the given job.
+fn job_windows(job: HANDLE) -> Result<Vec<HWND>> {
     struct Search {
         job: HANDLE,
-        window: Option<HWND>,
+        windows: Vec<HWND>,
     }
     unsafe extern "system" fn visit(window: HWND, param: LPARAM) -> BOOL {
         let search = unsafe { &mut *(param.0 as *mut Search) };
-        if search.window.is_some() || !unsafe { IsWindowVisible(window) }.as_bool() {
+        if !unsafe { IsWindowVisible(window) }.as_bool() {
             return true.into();
         }
         let mut class = [0u16; 64];
@@ -430,19 +443,26 @@ pub fn focus(id: Uuid) -> Result<bool> {
             if unsafe { IsProcessInJob(h.0, Some(search.job), &mut belongs) }.is_ok()
                 && belongs.as_bool()
             {
-                search.window = Some(window);
+                search.windows.push(window);
             }
         }
         true.into()
     }
     let mut s = Search {
-        job: job.0,
-        window: None,
+        job,
+        windows: vec![],
     };
     unsafe {
         EnumWindows(Some(visit), LPARAM((&raw mut s) as isize))?;
     }
-    if let Some(window) = s.window {
+    Ok(s.windows)
+}
+
+pub fn focus(id: Uuid) -> Result<bool> {
+    let Some(job) = existing_job(id)? else {
+        return Ok(false);
+    };
+    if let Some(&window) = job_windows(job.0)?.first() {
         unsafe {
             if IsIconic(window).as_bool() {
                 let _ = ShowWindow(window, SW_RESTORE);
@@ -453,6 +473,184 @@ pub fn focus(id: Uuid) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Taskbar identity for a profile's Edge windows, separate from Switchboard and plain Edge.
+pub fn profile_app_id(id: Uuid) -> String {
+    format!("{}.Profile.{}", crate::jump_list::APP_ID, id.simple())
+}
+
+struct Icon(HICON);
+impl Drop for Icon {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyIcon(self.0);
+        }
+    }
+}
+
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Gives a profile's Edge windows its Switchboard icon, own taskbar group, and relaunch command.
+///
+/// Edge only receives standard window properties and icon messages; it is never patched. The icon
+/// handles belong to this process, so the brand must live as long as the Edge session.
+pub struct WindowBrand {
+    app_id: String,
+    command: String,
+    name: String,
+    icon: PathBuf,
+    modified: Option<std::time::SystemTime>,
+    revision: u64,
+    icons: Vec<(u32, Icon, Icon)>,
+    retired: Vec<(u32, Icon, Icon)>,
+    branded: std::collections::HashMap<isize, u64>,
+    com: bool,
+}
+impl Drop for WindowBrand {
+    fn drop(&mut self) {
+        if self.com {
+            unsafe { CoUninitialize() }
+        }
+    }
+}
+impl WindowBrand {
+    pub fn new(id: Uuid, name: &str, icon: &Path) -> Result<Self> {
+        let exe = env::current_exe()?;
+        Ok(Self {
+            app_id: profile_app_id(id),
+            command: format!("\"{}\" --open {id}", exe.display()),
+            name: name.into(),
+            icon: icon.into(),
+            modified: modified(icon),
+            revision: 0,
+            icons: vec![],
+            retired: vec![],
+            branded: Default::default(),
+            com: unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok(),
+        })
+    }
+    /// Notices edited artwork; returns true so the caller can also refresh the profile name.
+    pub fn icon_changed(&mut self) -> bool {
+        let now = modified(&self.icon);
+        if now == self.modified {
+            return false;
+        }
+        self.modified = now;
+        // Windows keep showing the old handles until the next apply replaces them.
+        self.retired.append(&mut self.icons);
+        self.revision += 1;
+        true
+    }
+    pub fn rename(&mut self, name: &str) {
+        if self.name != name {
+            self.name = name.into();
+            self.revision += 1;
+        }
+    }
+    /// Brands every taskbar window of the job; windows that vanish meanwhile are skipped.
+    pub fn apply(&mut self, job: &Job) -> Result<()> {
+        let windows = job_windows((job.0).0)?;
+        self.branded
+            .retain(|&key, _| windows.iter().any(|w| w.0 as isize == key));
+        for window in windows {
+            let _ = self.brand(window);
+        }
+        self.retired.clear();
+        Ok(())
+    }
+    fn brand(&mut self, window: HWND) -> Result<()> {
+        unsafe {
+            let style = GetWindowLongPtrW(window, GWL_EXSTYLE) as u32;
+            if GetWindow(window, GW_OWNER).is_ok() || style & WS_EX_TOOLWINDOW.0 != 0 {
+                return Ok(());
+            }
+        }
+        let store: IPropertyStore = unsafe { SHGetPropertyStoreForWindow(window)? };
+        let current = unsafe { store.GetValue(&PKEY_AppUserModel_ID)? };
+        let current = windows::core::BSTR::try_from(&current)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        // Installed web apps keep the identity Edge gives them.
+        if current.contains("_crx_") {
+            return Ok(());
+        }
+        let key = window.0 as isize;
+        if current != self.app_id || self.branded.get(&key) != Some(&self.revision) {
+            let icon = format!("{},0", self.icon.display());
+            unsafe {
+                if current == self.app_id {
+                    // Re-registering makes the taskbar pick up a renamed or redrawn profile.
+                    store.SetValue(&PKEY_AppUserModel_ID, &PROPVARIANT::default())?;
+                    store.Commit()?;
+                }
+                store.SetValue(
+                    &PKEY_AppUserModel_RelaunchCommand,
+                    &PROPVARIANT::from(self.command.as_str()),
+                )?;
+                store.SetValue(
+                    &PKEY_AppUserModel_RelaunchDisplayNameResource,
+                    &PROPVARIANT::from(self.name.as_str()),
+                )?;
+                store.SetValue(
+                    &PKEY_AppUserModel_RelaunchIconResource,
+                    &PROPVARIANT::from(icon.as_str()),
+                )?;
+                store.SetValue(
+                    &PKEY_AppUserModel_ID,
+                    &PROPVARIANT::from(self.app_id.as_str()),
+                )?;
+                store.Commit()?;
+            }
+            self.branded.insert(key, self.revision);
+        }
+        let dpi = unsafe { GetDpiForWindow(window) }.max(96);
+        if !self.icons.iter().any(|(d, ..)| *d == dpi) {
+            let path = HSTRING::from(self.icon.as_os_str());
+            let load = |metric| -> Result<Icon> {
+                let size = unsafe { GetSystemMetricsForDpi(metric, dpi) };
+                let handle =
+                    unsafe { LoadImageW(None, &path, IMAGE_ICON, size, size, LR_LOADFROMFILE)? };
+                Ok(Icon(HICON(handle.0)))
+            };
+            let (big, small) = (load(SM_CXICON)?, load(SM_CXSMICON)?);
+            self.icons.push((dpi, big, small));
+        }
+        let (_, big, small) = self
+            .icons
+            .iter()
+            .find(|(d, ..)| *d == dpi)
+            .context("Profile icon is not loaded.")?;
+        for (kind, icon) in [(ICON_BIG, big), (ICON_SMALL, small)] {
+            let mut shown = 0;
+            unsafe {
+                // Timeouts keep a hung Edge window from stalling the session watcher.
+                SendMessageTimeoutW(
+                    window,
+                    WM_GETICON,
+                    WPARAM(kind as usize),
+                    LPARAM(0),
+                    SMTO_ABORTIFHUNG,
+                    200,
+                    Some(&mut shown),
+                );
+                if shown != icon.0.0 as usize {
+                    SendMessageTimeoutW(
+                        window,
+                        WM_SETICON,
+                        WPARAM(kind as usize),
+                        LPARAM(icon.0.0 as isize),
+                        SMTO_ABORTIFHUNG,
+                        200,
+                        None,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn link_name(name: &str) -> String {
@@ -527,28 +725,9 @@ fn write_link(
     folder: &Path,
     candidate: impl Fn(u32) -> Option<PathBuf> + Send + 'static,
 ) -> Result<Option<PathBuf>> {
-    // Keep COM apartment ownership independent of the UI backend.
-    let (id, name, icon, folder) = (p.id, p.name.clone(), icon.to_owned(), folder.to_owned());
-    std::thread::spawn(move || -> Result<Option<PathBuf>> {
-        unsafe {
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
-        }
-        struct Com;
-        impl Drop for Com {
-            fn drop(&mut self) {
-                unsafe { CoUninitialize() }
-            }
-        }
-        let _com = Com;
-        let link: IShellLinkW =
-            unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)? };
-        let exe = env::current_exe()?;
-        unsafe {
-            link.SetPath(&HSTRING::from(exe.as_os_str()))?;
-            link.SetArguments(&HSTRING::from(format!("--open {id}")))?;
-            link.SetIconLocation(&HSTRING::from(icon.as_os_str()), 0)?;
-            link.SetDescription(&HSTRING::from(format!("Open {name} in Switchboard")))?;
-        }
+    let (p, icon, folder) = (p.clone(), icon.to_owned(), folder.to_owned());
+    with_com(move || {
+        let link = profile_link(&p, &icon)?;
         let tmp = tempfile::Builder::new()
             .suffix(".lnk")
             .tempfile_in(&folder)?
@@ -577,8 +756,44 @@ fn write_link(
         }
         Ok(None)
     })
+}
+
+pub(crate) fn with_com<T: Send + 'static>(
+    run: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    // Keep COM apartment ownership independent of the UI backend.
+    std::thread::spawn(move || {
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
+        struct Com;
+        impl Drop for Com {
+            fn drop(&mut self) {
+                unsafe { CoUninitialize() }
+            }
+        }
+        let _com = Com;
+        run()
+    })
     .join()
-    .map_err(|_| anyhow::anyhow!("Shortcut writer stopped unexpectedly."))?
+    .map_err(|_| anyhow::anyhow!("Shell worker stopped unexpectedly."))?
+}
+
+pub(crate) fn profile_link(p: &Profile, icon: &Path) -> Result<IShellLinkW> {
+    let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)? };
+    let exe = env::current_exe()?;
+    let properties: IPropertyStore = link.cast()?;
+    unsafe {
+        link.SetPath(&HSTRING::from(exe.as_os_str()))?;
+        link.SetArguments(&HSTRING::from(format!("--open {}", p.id)))?;
+        link.SetIconLocation(&HSTRING::from(icon.as_os_str()), 0)?;
+        link.SetDescription(&HSTRING::from(format!("Open {} in Switchboard", p.name)))?;
+        properties.SetValue(&PKEY_Title, &PROPVARIANT::from(p.name.as_str()))?;
+        properties.SetValue(
+            &PKEY_AppUserModel_ID,
+            &PROPVARIANT::from(crate::jump_list::APP_ID),
+        )?;
+        properties.Commit()?;
+    }
+    Ok(link)
 }
 
 /// Ends every process in a session's job; used only for disposable temporary sessions.
@@ -592,6 +807,138 @@ pub fn stop_session(id: Uuid) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profile_shell_links_keep_the_id_title_icon_and_switchboard_taskbar_identity() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let icon = dir.path().join("customer.ico");
+        let p = Profile {
+            id: Uuid::new_v4(),
+            name: "Customer \"North\"".into(),
+            collection: String::new(),
+            symbol: 0,
+            color: 0,
+            pinned: false,
+            trashed: false,
+            opened: 1,
+            shortcuts: vec![],
+        };
+        let destination = shortcut(&p, &icon, dir.path())?;
+        with_com(move || {
+            let link: IShellLinkW =
+                unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)? };
+            let persist: IPersistFile = link.cast()?;
+            unsafe { persist.Load(&HSTRING::from(destination.as_os_str()), STGM_READ)? };
+            let properties: IPropertyStore = link.cast()?;
+            let mut args = [0u16; 128];
+            let mut path = vec![0u16; 32768];
+            let mut icon_path = vec![0u16; 32768];
+            let mut icon_index = -1;
+            unsafe {
+                link.GetArguments(&mut args)?;
+                link.GetPath(&mut path, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)?;
+                link.GetIconLocation(&mut icon_path, &mut icon_index)?;
+                let title = properties.GetValue(&PKEY_Title)?;
+                let app_id = properties.GetValue(&PKEY_AppUserModel_ID)?;
+                assert_eq!(windows::core::BSTR::try_from(&title)?.to_string(), p.name);
+                assert_eq!(
+                    windows::core::BSTR::try_from(&app_id)?.to_string(),
+                    crate::jump_list::APP_ID
+                );
+            }
+            let string = |buffer: &[u16]| {
+                String::from_utf16(
+                    &buffer[..buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len())],
+                )
+                .unwrap()
+            };
+            assert_eq!(string(&args), format!("--open {}", p.id));
+            assert_eq!(PathBuf::from(string(&path)), env::current_exe()?);
+            assert_eq!(PathBuf::from(string(&icon_path)), icon);
+            assert_eq!(icon_index, 0);
+            Ok(())
+        })
+    }
+
+    #[test]
+    #[ignore = "starts Microsoft Edge"]
+    fn edge_windows_keep_the_profile_icon_and_taskbar_identity() -> Result<()> {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir()?;
+        let icon = dir.path().join("profile.ico");
+        crate::icons::write_ico(std::fs::File::create(&icon)?, 3, 2)?;
+        let id = Uuid::new_v4();
+        let job = launch_edge(id, &dir.path().join("Data"), true)?;
+        let mut brand = WindowBrand::new(id, "Customer North", &icon)?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let window = loop {
+            brand.apply(&job)?;
+            if let Some(w) = job_windows((job.0).0)?
+                .into_iter()
+                .find(|w| brand.branded.contains_key(&(w.0 as isize)))
+            {
+                break w;
+            }
+            ensure!(Instant::now() < deadline, "No Edge window was branded.");
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        // Edge finishes initializing after its first window appears; branding must persist.
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_millis(200));
+            brand.apply(&job)?;
+        }
+        // Edge may replace its first window during startup; check the window that remains.
+        let window = job_windows((job.0).0)?
+            .into_iter()
+            .find(|w| brand.branded.contains_key(&(w.0 as isize)))
+            .unwrap_or(window);
+        let text = |key| -> Result<String> {
+            let store: IPropertyStore = unsafe { SHGetPropertyStoreForWindow(window)? };
+            let value = unsafe { store.GetValue(key)? };
+            Ok(windows::core::BSTR::try_from(&value)?.to_string())
+        };
+        let result = (|| {
+            assert_eq!(text(&PKEY_AppUserModel_ID)?, profile_app_id(id));
+            assert_eq!(
+                text(&PKEY_AppUserModel_RelaunchCommand)?,
+                format!("\"{}\" --open {id}", env::current_exe()?.display())
+            );
+            assert_eq!(
+                text(&PKEY_AppUserModel_RelaunchIconResource)?,
+                format!("{},0", icon.display())
+            );
+            assert_eq!(
+                text(&PKEY_AppUserModel_RelaunchDisplayNameResource)?,
+                "Customer North"
+            );
+            let ours: Vec<usize> = brand
+                .icons
+                .iter()
+                .flat_map(|(_, big, small)| [big.0.0 as usize, small.0.0 as usize])
+                .collect();
+            for kind in [ICON_BIG, ICON_SMALL] {
+                let shown =
+                    unsafe { SendMessageW(window, WM_GETICON, Some(WPARAM(kind as usize)), None) };
+                assert!(ours.contains(&(shown.0 as usize)), "Edge reset its icon.");
+            }
+            let _second = launch_edge(id, &dir.path().join("Data"), true)?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while brand.branded.len() < 2 {
+                ensure!(
+                    Instant::now() < deadline,
+                    "A new Edge window was not branded."
+                );
+                std::thread::sleep(Duration::from_millis(200));
+                brand.apply(&job)?;
+            }
+            Ok(())
+        })();
+        stop_session(id)?;
+        while job.active()? {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        result
+    }
+
     #[test]
     fn shortcut_names_are_safe_and_collision_free() {
         let d = tempfile::tempdir().unwrap();

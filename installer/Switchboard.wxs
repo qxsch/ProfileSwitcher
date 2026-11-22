@@ -15,7 +15,9 @@
                          Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
           <File Id="SwitchboardExe" Name="switchboard.exe" Source="$(var.Executable)">
             <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder"
-                      Name="Switchboard" WorkingDirectory="INSTALLFOLDER" Advertise="no" />
+                      Name="Switchboard" WorkingDirectory="INSTALLFOLDER" Advertise="no">
+              <ShortcutProperty Key="System.AppUserModel.ID" Value="Qxsch.Switchboard" />
+            </Shortcut>
           </File>
           <RemoveFolder Id="RemoveInstallFolder" On="uninstall" />
         </Component>
